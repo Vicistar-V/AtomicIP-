@@ -66,6 +66,9 @@ pub const MAX_METADATA_BYTES: u32 = 1024;
 /// This is a placeholder - should be set during contract initialization
 pub const NOTARY_PUBLIC_KEY: &[u8] = b"notary_public_key_placeholder";
 
+/// Issue #437: Number of storage shards for commitment distribution.
+pub const NUM_SHARDS: u32 = 16;
+
 
 // ── Storage Keys ────────────────────────────────────────────────────────────
 
@@ -93,6 +96,16 @@ pub enum DataKey {
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
+
+/// Issue #436: A single immutable audit entry for an IP record.
+/// Entries are append-only and can never be modified or removed.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct AuditEntry {
+    pub action: soroban_sdk::Symbol, // e.g. "committed", "revoked", "transferred"
+    pub actor: Address,
+    pub timestamp: u64,
+}
 
 #[contracttype]
 #[derive(Clone)]
@@ -284,6 +297,15 @@ impl IpRegistry {
             (symbol_short!("ip_commit"), owner.clone()),
             (id, record.timestamp),
         );
+
+        // Issue #436: Record immutable audit entry for commitment creation
+        Self::append_audit_entry(&env, id, symbol_short!("committed"), owner.clone());
+
+        // Issue #437: Assign IP to its shard
+        Self::assign_to_shard(&env, id, &commitment_hash);
+
+        // Issue #438: Store compressed commitment
+        Self::store_compressed_commitment(&env, id, &commitment_hash);
 
         // Issue #346: Update commitment checksum for rollback protection
         Self::update_commitment_checksum(&env);
@@ -491,8 +513,11 @@ impl IpRegistry {
         // Emit transfer event: (ip_id, old_owner, new_owner)
         env.events().publish(
             (TRANSFER_TOPIC, ip_id),
-            (old_owner, new_owner),
+            (old_owner, new_owner.clone()),
         );
+
+        // Issue #436: Record immutable audit entry for ownership transfer
+        Self::append_audit_entry(&env, ip_id, symbol_short!("xferred"), new_owner);
     }
 
     /// Transfer IP ownership to a new address (named alias for transfer_ip).
@@ -533,6 +558,9 @@ impl IpRegistry {
             (REVOKE_TOPIC, record.owner.clone()),
             (ip_id, env.ledger().timestamp()),
         );
+
+        // Issue #436: Record immutable audit entry for revocation
+        Self::append_audit_entry(&env, ip_id, symbol_short!("revoked"), record.owner);
     }
 
     /// Validate that a new WASM is compatible for upgrade.
@@ -1606,6 +1634,188 @@ impl IpRegistry {
             LEDGER_BUMP,
             LEDGER_BUMP,
         );
+    }
+
+    // ── Issue #439: Commitment Deduplication ──────────────────────────────────
+
+    /// Find an existing IP ID that holds the given commitment hash, if any.
+    /// Returns `Some(ip_id)` if a duplicate exists, `None` otherwise.
+    pub fn find_duplicate_commitment(env: Env, commitment_hash: BytesN<32>) -> Option<u64> {
+        let owner: Option<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CommitmentOwner(commitment_hash));
+        if owner.is_none() {
+            return None;
+        }
+        // Walk the owner's IP list to find the matching record
+        let owner_addr = owner.unwrap();
+        let ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OwnerIps(owner_addr))
+            .unwrap_or(Vec::new(&env));
+        for ip_id in ids.iter() {
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, IpRecord>(&DataKey::IpRecord(ip_id))
+            {
+                if record.commitment_hash == commitment_hash {
+                    return Some(ip_id);
+                }
+            }
+        }
+        None
+    }
+
+    /// Merge a duplicate IP commitment into the primary record.
+    ///
+    /// The duplicate's owner is added as a co-owner of the primary IP, and the
+    /// duplicate record is revoked. Only the primary IP owner may call this.
+    ///
+    /// # Panics
+    ///
+    /// Panics if either IP does not exist, the caller is not the primary owner,
+    /// or the two IPs do not share the same commitment hash.
+    pub fn merge_duplicate_commitment(env: Env, primary_ip_id: u64, duplicate_ip_id: u64) {
+        let mut primary = require_ip_exists(&env, primary_ip_id);
+        primary.owner.require_auth();
+
+        let mut duplicate = require_ip_exists(&env, duplicate_ip_id);
+
+        // Ensure both records share the same commitment hash
+        if primary.commitment_hash != duplicate.commitment_hash {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::CommitmentAlreadyRegistered as u32,
+            ));
+        }
+
+        // Add duplicate owner as co-owner of primary (if not already)
+        let dup_owner = duplicate.owner.clone();
+        let already_co_owner = primary.co_owners.iter().any(|a| a == dup_owner);
+        if !already_co_owner && dup_owner != primary.owner {
+            primary.co_owners.push_back(dup_owner.clone());
+            env.storage()
+                .persistent()
+                .set(&DataKey::IpRecord(primary_ip_id), &primary);
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::IpRecord(primary_ip_id), LEDGER_BUMP, LEDGER_BUMP);
+        }
+
+        // Revoke the duplicate record
+        duplicate.revoked = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::IpRecord(duplicate_ip_id), &duplicate);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::IpRecord(duplicate_ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        // Issue #436: Audit entries for the merge
+        Self::append_audit_entry(&env, primary_ip_id, symbol_short!("merged"), primary.owner.clone());
+        Self::append_audit_entry(&env, duplicate_ip_id, symbol_short!("revoked"), primary.owner);
+
+        env.events().publish(
+            (symbol_short!("dedup"), primary_ip_id),
+            (duplicate_ip_id, dup_owner),
+        );
+    }
+
+    // ── Issue #438: Commitment Compression ────────────────────────────────────
+
+    /// Retrieve the compressed (16-byte) form of a commitment hash for an IP.
+    /// The compressed form is the first 16 bytes of the full 32-byte hash,
+    /// reducing storage footprint by 50% for indexing use cases.
+    pub fn get_compressed_commitment(env: Env, ip_id: u64) -> BytesN<16> {
+        require_ip_exists(&env, ip_id);
+        env.storage()
+            .persistent()
+            .get(&DataKey::CompressedCommitment(ip_id))
+            .unwrap_or_else(|| BytesN::from_array(&env, &[0u8; 16]))
+    }
+
+    /// Internal: store the compressed commitment for an IP.
+    fn store_compressed_commitment(env: &Env, ip_id: u64, commitment_hash: &BytesN<32>) {
+        let full = commitment_hash.to_array();
+        let mut half = [0u8; 16];
+        half.copy_from_slice(&full[..16]);
+        let compressed = BytesN::from_array(env, &half);
+        env.storage()
+            .persistent()
+            .set(&DataKey::CompressedCommitment(ip_id), &compressed);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::CompressedCommitment(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    // ── Issue #437: Commitment Sharding ───────────────────────────────────────
+
+    /// Compute the shard ID for a commitment hash.
+    /// Uses the first byte of the hash modulo NUM_SHARDS.
+    pub fn get_commitment_shard(_env: Env, commitment_hash: BytesN<32>) -> u32 {
+        let bytes = commitment_hash.to_array();
+        (bytes[0] as u32) % NUM_SHARDS
+    }
+
+    /// Retrieve all IP IDs stored in a given shard.
+    pub fn get_shard_ip_ids(env: Env, shard_id: u32) -> Vec<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ShardIps(shard_id))
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// Internal: assign an IP to its shard based on its commitment hash.
+    fn assign_to_shard(env: &Env, ip_id: u64, commitment_hash: &BytesN<32>) {
+        let bytes = commitment_hash.to_array();
+        let shard_id = (bytes[0] as u32) % NUM_SHARDS;
+        let mut shard_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ShardIps(shard_id))
+            .unwrap_or(Vec::new(env));
+        shard_ids.push_back(ip_id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ShardIps(shard_id), &shard_ids);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::ShardIps(shard_id), LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    // ── Issue #436: Audit Trail Immutability ──────────────────────────────────
+
+    /// Append an immutable audit entry for an IP. Internal helper — entries are
+    /// never overwritten or removed, only appended.
+    fn append_audit_entry(env: &Env, ip_id: u64, action: soroban_sdk::Symbol, actor: Address) {
+        let mut trail: Vec<AuditEntry> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IpAuditTrail(ip_id))
+            .unwrap_or(Vec::new(env));
+        trail.push_back(AuditEntry {
+            action,
+            actor,
+            timestamp: env.ledger().timestamp(),
+        });
+        env.storage()
+            .persistent()
+            .set(&DataKey::IpAuditTrail(ip_id), &trail);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::IpAuditTrail(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    /// Retrieve the immutable audit trail for an IP.
+    /// Returns all audit entries in chronological order.
+    pub fn get_ip_audit_trail(env: Env, ip_id: u64) -> Vec<AuditEntry> {
+        require_ip_exists(&env, ip_id);
+        env.storage()
+            .persistent()
+            .get(&DataKey::IpAuditTrail(ip_id))
+            .unwrap_or(Vec::new(&env))
     }
 
     /// Verify the integrity of all commitments (for upgrade safety).
