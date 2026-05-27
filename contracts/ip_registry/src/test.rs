@@ -63,6 +63,8 @@ mod tests {
         fn cleanup_revoked_commitment(env: Env, ip_id: u64);
         fn create_snapshot(env: Env, caller: Address) -> u64;
         fn get_snapshot(env: Env, snapshot_id: u64) -> Option<crate::CommitmentSnapshot>;
+        fn compute_integrity_checksum(env: Env, caller: Address) -> BytesN<32>;
+        fn verify_integrity_checksum(env: Env) -> bool;
         fn initiate_dispute(env: Env, ip_id: u64, challenger: Address, evidence_hash: BytesN<32>) -> u64;
         fn submit_dispute_evidence(env: Env, dispute_id: u64, submitter: Address, evidence_hash: BytesN<32>);
         fn resolve_dispute(env: Env, dispute_id: u64, winner: Address);
@@ -1628,6 +1630,53 @@ mod tests {
         let contract_id = env.register(crate::IpRegistry, ());
         let client = IpRegistryClient::new(&env, &contract_id);
         assert!(client.get_snapshot(&999u64).is_none());
+    }
+
+    // ── Issue: Cryptographic Checksum Integrity Verification ────────────────────────────────────────
+
+    #[test]
+    fn test_compute_and_verify_integrity_checksum() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        client.commit_ip(&owner, &BytesN::from_array(&env, &[0xE1u8; 32]), &0u32);
+        client.commit_ip(&owner, &BytesN::from_array(&env, &[0xE2u8; 32]), &0u32);
+
+        let checksum = client.compute_integrity_checksum(&owner);
+        let zero = BytesN::from_array(&env, &[0u8; 32]);
+        assert_ne!(checksum, zero);
+        assert!(client.verify_integrity_checksum());
+    }
+
+    #[test]
+    fn test_verify_integrity_checksum_no_stored_returns_true() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        assert!(client.verify_integrity_checksum());
+    }
+
+    #[test]
+    fn test_checksum_excludes_revoked_commitments() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let id1 = client.commit_ip(&owner, &BytesN::from_array(&env, &[0xF1u8; 32]), &0u32);
+        client.commit_ip(&owner, &BytesN::from_array(&env, &[0xF2u8; 32]), &0u32);
+
+        let checksum_before = client.compute_integrity_checksum(&owner);
+
+        client.revoke_ip(&id1);
+        let checksum_after = client.compute_integrity_checksum(&owner);
+
+        assert_ne!(checksum_before, checksum_after);
+        assert!(client.verify_integrity_checksum());
     }
 
 }

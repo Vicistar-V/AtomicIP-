@@ -2367,6 +2367,94 @@ impl IpRegistry {
             .get(&DataKey::Snapshot(snapshot_id))
     }
 
+    // ── Issue: Cryptographic Checksum Integrity Verification ────────────────────────────────────────
+
+    /// Compute and store a sha256 checksum over all active (non-revoked)
+    /// commitment hashes in ID order. Admin-only.
+    ///
+    /// Returns the computed checksum. Stored under `CommitmentChecksumV2`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the caller is not the admin.
+    pub fn compute_integrity_checksum(env: Env, caller: Address) -> BytesN<32> {
+        caller.require_auth();
+        let admin: Option<Address> = env.storage().persistent().get(&DataKey::Admin);
+        if admin.map_or(true, |a| a != caller) {
+            env.panic_with_error(soroban_sdk::Error::from_contract_error(
+                ContractError::Unauthorized as u32,
+            ));
+        }
+
+        let next_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextId)
+            .unwrap_or(1);
+
+        let mut preimage = Bytes::new(&env);
+        for id in 1..next_id {
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, IpRecord>(&DataKey::IpRecord(id))
+            {
+                if !record.revoked {
+                    preimage.append(&record.commitment_hash.into());
+                }
+            }
+        }
+
+        let checksum: BytesN<32> = env.crypto().sha256(&preimage).into();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::CommitmentChecksumV2, &checksum);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::CommitmentChecksumV2, LEDGER_BUMP, LEDGER_BUMP);
+
+        checksum
+    }
+
+    /// Verify that the stored integrity checksum matches a freshly computed one.
+    ///
+    /// Returns `true` if they match or no checksum has been stored yet.
+    /// Returns `false` if the stored checksum differs from the recomputed one.
+    pub fn verify_integrity_checksum(env: Env) -> bool {
+        let stored: Option<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CommitmentChecksumV2);
+
+        let stored = match stored {
+            Some(s) => s,
+            None => return true,
+        };
+
+        let next_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextId)
+            .unwrap_or(1);
+
+        let mut preimage = Bytes::new(&env);
+        for id in 1..next_id {
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, IpRecord>(&DataKey::IpRecord(id))
+            {
+                if !record.revoked {
+                    preimage.append(&record.commitment_hash.into());
+                }
+            }
+        }
+
+        let recomputed: BytesN<32> = env.crypto().sha256(&preimage).into();
+        stored == recomputed
+    }
+
 fn require_is_revoked(env: &Env, record: &IpRecord) {
     if !record.revoked {
         env.panic_with_error(soroban_sdk::Error::from_contract_error(
