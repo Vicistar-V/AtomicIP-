@@ -346,6 +346,15 @@ pub struct BatchKeysRevealedEvent {
     pub seller: Address,
 }
 
+// ── #527: Batch Signing Event ─────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct BatchSignedEvent {
+    pub swap_ids: Vec<u64>,
+    pub signer: Address,
+}
+
 // ── #358: Timeout Escalation Event ────────────────────────────────────────────
 
 #[contracttype]

@@ -220,3 +220,41 @@ swap_contract.reveal_key(swap_id, secret, blinding_factor);
 - [Commitment Scheme](commitment-scheme.md) — How to construct valid secrets
 - [Security Considerations](security.md) — Best practices for key management
 - [Threat Model](threat-model.md) — Attack vectors and mitigations
+
+---
+
+## Multi-Party Signing (Batch)
+
+For IP assets co-owned by multiple inventors, the swap can require all co-signers to approve before the key is revealed.
+
+### Initiate with Required Signers
+
+```rust
+atomic_swap.initiate_swap_with_signers(
+    token, ip_id, seller, price, buyer,
+    vec![seller, co_inventor_1, co_inventor_2],
+);
+```
+
+### Sign Individually
+
+```rust
+atomic_swap.sign_swap_reveal(swap_id, signer);
+```
+
+### Batch Sign Multiple Swaps (Issue #527)
+
+A co-signer can approve multiple swaps in a single call:
+
+```rust
+atomic_swap.batch_sign_swap_reveal(
+    vec![swap_id_1, swap_id_2, swap_id_3],
+    signer,
+);
+```
+
+**Rules:**
+- `signer` must be in the required signers list for every swap in the batch
+- Each swap must be in `Accepted` state
+- Duplicate signatures are rejected
+- `reveal_key` / `batch_reveal_keys` remain blocked until all required signers have signed
