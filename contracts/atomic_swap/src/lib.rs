@@ -2866,6 +2866,102 @@ impl AtomicSwap {
         id
     }
 
+    /// Batch initiate multiple escrow-mode swaps in a single transaction.
+    ///
+    /// Each `ip_ids[i]` is paired with `prices[i]` and `timeouts[i]` (expiry).
+    /// Returns a vector of assigned swap IDs.
+    pub fn batch_initiate_escrow(
+        env: Env,
+        token: Address,
+        ip_ids: Vec<u64>,
+        seller: Address,
+        prices: Vec<i128>,
+        buyer: Address,
+        timeouts: Vec<u64>,
+    ) -> Vec<u64> {
+        require_not_paused(&env);
+        seller.require_auth();
+
+        let len = ip_ids.len();
+        if len == 0 || prices.len() != len || timeouts.len() != len {
+            env.panic_with_error(Error::from_contract_error(ContractError::PriceTooSmall as u32));
+        }
+
+        let mut swap_ids: Vec<u64> = Vec::new(&env);
+
+        for i in 0..len {
+            let ip_id = ip_ids.get(i).unwrap();
+            let price = prices.get(i).unwrap();
+            let timeout = timeouts.get(i).unwrap();
+
+            require_positive_price(&env, price);
+            registry::ensure_seller_owns_active_ip(&env, ip_id, &seller);
+            require_no_active_swap(&env, ip_id);
+
+            let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(0);
+
+            let swap = SwapRecord {
+                ip_id,
+                seller: seller.clone(),
+                buyer: buyer.clone(),
+                price,
+                token: token.clone(),
+                status: SwapStatus::Pending,
+                expiry: *timeout,
+                accept_timestamp: 0,
+                required_approvals: 0,
+                dispute_timestamp: 0,
+                referrer: None,
+                collateral_amount: 0,
+                insurance_premium: 0,
+                insurance_enabled: false,
+                escrow_agent: None,
+                quantity: 1,
+                conditions: Vec::new(&env),
+            };
+
+            env.storage().persistent().set(&DataKey::Swap(id), &swap);
+            env.storage().persistent().extend_ttl(&DataKey::Swap(id), LEDGER_BUMP, LEDGER_BUMP);
+            env.storage().persistent().set(&DataKey::ActiveSwap(ip_id), &id);
+            env.storage().persistent().extend_ttl(&DataKey::ActiveSwap(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+            env.storage().persistent().set(&DataKey::SwapMode(id), &SwapMode::Escrow);
+            env.storage().persistent().extend_ttl(&DataKey::SwapMode(id), LEDGER_BUMP, LEDGER_BUMP);
+
+            swap::append_swap_for_party(&env, &seller, &buyer, id);
+
+            let mut ip_swap_ids: Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::IpSwaps(ip_id))
+                .unwrap_or(Vec::new(&env));
+            ip_swap_ids.push_back(id);
+            env.storage()
+                .persistent()
+                .set(&DataKey::IpSwaps(ip_id), &ip_swap_ids);
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::IpSwaps(ip_id), 50000, 50000);
+
+            Self::append_history(&env, id, SwapStatus::Pending);
+            env.storage().instance().set(&DataKey::NextId, &(id + 1));
+
+            env.events().publish(
+                (soroban_sdk::symbol_short!("esc_ini"),),
+                SwapInitiatedEvent {
+                    swap_id: id,
+                    ip_id,
+                    seller: seller.clone(),
+                    buyer: buyer.clone(),
+                    price,
+                },
+            );
+
+            swap_ids.push_back(id);
+        }
+
+        swap_ids
+    }
+
     /// Buyer deposits funds into escrow. Moves swap to `Accepted`.
     ///
     /// Transfers `price` tokens from buyer to the contract. Can only be called

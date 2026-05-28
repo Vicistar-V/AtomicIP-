@@ -48,6 +48,8 @@ mod tests {
         fn commit_ip_version(env: Env, owner: Address, commitment_hash: BytesN<32>, parent_ip_id: u64) -> u64;
         // Issue #432
         fn batch_verify_commitments(env: Env, verifications: Vec<(u64, BytesN<32>, BytesN<32>)>) -> Vec<bool>;
+        fn batch_commit_ip_anonymous(env: Env, blinded_owner: BytesN<32>, commitment_hashes: Vec<BytesN<32>>) -> Vec<u64>;
+        fn get_anonymous_owner(env: Env, commitment_hash: BytesN<32>) -> Option<BytesN<32>>;
         // Issue #433
         fn issue_ownership_challenge(env: Env, ip_id: u64, challenger: Address, nonce: BytesN<32>) -> u64;
         fn respond_to_ownership_challenge(env: Env, challenge_id: u64, response_hash: BytesN<32>);
@@ -664,6 +666,41 @@ mod tests {
         for i in 0..5 {
             assert_eq!(ids.get(i).unwrap(), (i + 1) as u64);
         }
+    }
+
+    #[test]
+    fn test_batch_commit_ip_anonymous_creates_records() {
+        let env = Env::default();
+        // Anonymous commits do not require caller auth
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        // Create anonymous commitment hashes
+        let commitment1 = BytesN::from_array(&env, &[11u8; 32]);
+        let commitment2 = BytesN::from_array(&env, &[12u8; 32]);
+        let mut hashes: Vec<BytesN<32>> = Vec::new(&env);
+        hashes.push_back(commitment1.clone());
+        hashes.push_back(commitment2.clone());
+
+        // Blinded owner identifier (off-chain proof pointer)
+        let blinded_owner = BytesN::from_array(&env, &[7u8; 32]);
+
+        // Call anonymous batch commit
+        let ids = client.batch_commit_ip_anonymous(&blinded_owner, &hashes);
+
+        assert_eq!(ids.len(), 2);
+
+        // Verify records exist and contain expected commitment hashes
+        let rec1 = client.get_ip(&ids.get(0).unwrap());
+        let rec2 = client.get_ip(&ids.get(1).unwrap());
+
+        assert_eq!(rec1.commitment_hash, commitment1);
+        assert_eq!(rec2.commitment_hash, commitment2);
+
+        // Ensure anonymous commits did not populate owner index for a random owner
+        let random_owner = <Address as TestAddress>::generate(&env);
+        let listed = client.list_ip_by_owner(&random_owner);
+        assert_eq!(listed.len(), 0);
     }
 
     #[test]
@@ -1873,5 +1910,240 @@ mod tests {
         let event = events.get(0).unwrap();
         let expected_topics = (symbol_short!("exp_warn"), ip_id).into_val(&env);
         assert_eq!(event.1, expected_topics);
+    }
+
+    // ── Tests for batch_commit_ip_anonymous ───────────────────────────────────
+
+    /// Happy path: two hashes produce two sequential IDs and records are retrievable.
+    #[test]
+    fn test_anon_batch_creates_records_with_correct_hashes() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let blinded_owner = BytesN::from_array(&env, &[0xAAu8; 32]);
+        let h1 = BytesN::from_array(&env, &[0x11u8; 32]);
+        let h2 = BytesN::from_array(&env, &[0x22u8; 32]);
+        let hashes = Vec::from_array(&env, [h1.clone(), h2.clone()]);
+
+        let ids = client.batch_commit_ip_anonymous(&blinded_owner, &hashes);
+
+        assert_eq!(ids.len(), 2);
+        let rec1 = client.get_ip(&ids.get(0).unwrap());
+        let rec2 = client.get_ip(&ids.get(1).unwrap());
+        assert_eq!(rec1.commitment_hash, h1);
+        assert_eq!(rec2.commitment_hash, h2);
+    }
+
+    /// IDs are sequential and continue from the global counter.
+    #[test]
+    fn test_anon_batch_ids_are_sequential() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        // Commit one regular IP first so the counter starts at 2 for the batch.
+        let owner = <Address as TestAddress>::generate(&env);
+        client.commit_ip(&owner, &BytesN::from_array(&env, &[0x01u8; 32]), &0u32);
+
+        let blinded_owner = BytesN::from_array(&env, &[0xBBu8; 32]);
+        let hashes = Vec::from_array(&env, [
+            BytesN::from_array(&env, &[0x02u8; 32]),
+            BytesN::from_array(&env, &[0x03u8; 32]),
+        ]);
+
+        let ids = client.batch_commit_ip_anonymous(&blinded_owner, &hashes);
+
+        assert_eq!(ids.get(0).unwrap(), 2u64);
+        assert_eq!(ids.get(1).unwrap(), 3u64);
+    }
+
+    /// Anonymous commits must NOT appear in the owner index.
+    #[test]
+    fn test_anon_batch_does_not_populate_owner_index() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let blinded_owner = BytesN::from_array(&env, &[0xCCu8; 32]);
+        let hashes = Vec::from_array(&env, [BytesN::from_array(&env, &[0x33u8; 32])]);
+        client.batch_commit_ip_anonymous(&blinded_owner, &hashes);
+
+        let any_address = <Address as TestAddress>::generate(&env);
+        assert_eq!(client.list_ip_by_owner(&any_address).len(), 0);
+    }
+
+    /// The on-chain record owner must be the contract address, not the submitter.
+    #[test]
+    fn test_anon_batch_record_owner_is_contract_address() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let blinded_owner = BytesN::from_array(&env, &[0xDDu8; 32]);
+        let h = BytesN::from_array(&env, &[0x44u8; 32]);
+        let ids = client.batch_commit_ip_anonymous(&blinded_owner, &Vec::from_array(&env, [h]));
+
+        let record = client.get_ip(&ids.get(0).unwrap());
+        assert_eq!(record.owner, contract_id);
+    }
+
+    /// blinded_owner is stored and retrievable via get_anonymous_owner.
+    #[test]
+    fn test_anon_batch_stores_blinded_owner() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let blinded_owner = BytesN::from_array(&env, &[0xEEu8; 32]);
+        let h = BytesN::from_array(&env, &[0x55u8; 32]);
+        client.batch_commit_ip_anonymous(&blinded_owner, &Vec::from_array(&env, [h.clone()]));
+
+        let stored = client.get_anonymous_owner(&h);
+        assert_eq!(stored, Some(blinded_owner));
+    }
+
+    /// get_anonymous_owner returns None for a hash committed via commit_ip (not anonymous).
+    #[test]
+    fn test_get_anonymous_owner_returns_none_for_non_anonymous_commit() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let h = BytesN::from_array(&env, &[0x66u8; 32]);
+        client.commit_ip(&owner, &h, &0u32);
+
+        assert_eq!(client.get_anonymous_owner(&h), None);
+    }
+
+    /// Each commitment emits an "ip_commit_anon" event with (id, timestamp, blinded_owner).
+    #[test]
+    fn test_anon_batch_emits_event_per_commitment() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let blinded_owner = BytesN::from_array(&env, &[0xFFu8; 32]);
+        let h1 = BytesN::from_array(&env, &[0x77u8; 32]);
+        let h2 = BytesN::from_array(&env, &[0x88u8; 32]);
+        let ids = client.batch_commit_ip_anonymous(
+            &blinded_owner,
+            &Vec::from_array(&env, [h1, h2]),
+        );
+
+        let all_events = env.events().all();
+        // Exactly two ip_commit_anon events (one per hash).
+        let anon_events: soroban_sdk::Vec<_> = {
+            let mut v = soroban_sdk::Vec::new(&env);
+            for e in all_events.iter() {
+                let (_, topics, _) = e;
+                if let Ok(t) = soroban_sdk::Vec::<soroban_sdk::Val>::try_from_val(&env, &topics) {
+                    if let Some(first) = t.get(0) {
+                        if let Ok(s) = soroban_sdk::Symbol::try_from_val(&env, &first) {
+                            if s == symbol_short!("ip_commit_anon") {
+                                v.push_back(e);
+                            }
+                        }
+                    }
+                }
+            }
+            v
+        };
+        assert_eq!(anon_events.len(), 2, "expected one event per commitment");
+
+        // Verify first event data contains the correct ip_id and blinded_owner.
+        let (_, _, data) = anon_events.get(0).unwrap();
+        let (event_id, _ts, event_blinded): (u64, u64, BytesN<32>) =
+            TryFromVal::try_from_val(&env, &data).unwrap();
+        assert_eq!(event_id, ids.get(0).unwrap());
+        assert_eq!(event_blinded, blinded_owner);
+    }
+
+    /// A zero commitment hash in the batch must panic.
+    #[test]
+    #[should_panic]
+    fn test_anon_batch_zero_hash_rejected() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let blinded_owner = BytesN::from_array(&env, &[0x01u8; 32]);
+        let zero = BytesN::from_array(&env, &[0u8; 32]);
+        client.batch_commit_ip_anonymous(&blinded_owner, &Vec::from_array(&env, [zero]));
+    }
+
+    /// A duplicate commitment hash (already registered) must panic.
+    #[test]
+    #[should_panic]
+    fn test_anon_batch_duplicate_hash_rejected() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let blinded_owner = BytesN::from_array(&env, &[0x02u8; 32]);
+        let h = BytesN::from_array(&env, &[0x99u8; 32]);
+        // First call succeeds.
+        client.batch_commit_ip_anonymous(&blinded_owner, &Vec::from_array(&env, [h.clone()]));
+        // Second call with the same hash must panic.
+        client.batch_commit_ip_anonymous(&blinded_owner, &Vec::from_array(&env, [h]));
+    }
+
+    /// Duplicate hash within the same batch must panic on the second occurrence.
+    #[test]
+    #[should_panic]
+    fn test_anon_batch_intra_batch_duplicate_rejected() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let blinded_owner = BytesN::from_array(&env, &[0x03u8; 32]);
+        let h = BytesN::from_array(&env, &[0xAAu8; 32]);
+        // Same hash twice in one batch.
+        client.batch_commit_ip_anonymous(&blinded_owner, &Vec::from_array(&env, [h.clone(), h]));
+    }
+
+    /// Empty batch must panic.
+    #[test]
+    #[should_panic]
+    fn test_anon_batch_empty_batch_rejected() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let blinded_owner = BytesN::from_array(&env, &[0x04u8; 32]);
+        let empty: Vec<BytesN<32>> = Vec::new(&env);
+        client.batch_commit_ip_anonymous(&blinded_owner, &empty);
+    }
+
+    /// Anonymous and regular commits share the same ID counter correctly.
+    #[test]
+    fn test_anon_batch_interleaved_with_regular_commits() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+
+        let id1 = client.commit_ip(&owner, &BytesN::from_array(&env, &[0x10u8; 32]), &0u32);
+
+        let blinded_owner = BytesN::from_array(&env, &[0x05u8; 32]);
+        let anon_ids = client.batch_commit_ip_anonymous(
+            &blinded_owner,
+            &Vec::from_array(&env, [
+                BytesN::from_array(&env, &[0x20u8; 32]),
+                BytesN::from_array(&env, &[0x30u8; 32]),
+            ]),
+        );
+
+        let id4 = client.commit_ip(&owner, &BytesN::from_array(&env, &[0x40u8; 32]), &0u32);
+
+        assert_eq!(id1, 1);
+        assert_eq!(anon_ids.get(0).unwrap(), 2);
+        assert_eq!(anon_ids.get(1).unwrap(), 3);
+        assert_eq!(id4, 4);
     }
 }

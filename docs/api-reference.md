@@ -128,6 +128,135 @@ let ip_ids = registry.batch_commit_ip(&owner, &hashes);
 
 ---
 
+## `batch_commit_ip_anonymous`
+
+Commit multiple IP hashes anonymously in a single transaction. The contract stores a blinded owner identifier alongside each commitment; the on-chain `owner` field is set to the contract address to avoid exposing the submitter.
+
+### Signature
+
+```rust
+pub fn batch_commit_ip_anonymous(
+    env: Env,
+    blinded_owner: BytesN<32>,
+    commitment_hashes: Vec<BytesN<32>>,
+) -> Vec<u64>
+```
+
+### Parameters
+
+| Parameter | Type | Description |
+|---|---|---|
+| `env` | `Env` | Soroban environment |
+| `blinded_owner` | `BytesN<32>` | Off-chain blinded owner identifier (e.g. `sha256(owner \|\| nonce)`). Stored per commitment for later ownership proof. |
+| `commitment_hashes` | `Vec<BytesN<32>>` | Non-empty vector of commitment hashes to register anonymously. |
+
+### Returns
+
+`Vec<u64>` — Assigned sequential IP IDs in the same order as the input hashes.
+
+### Panics
+
+| Error | Code | Condition |
+|---|---|---|
+| `ZeroCommitmentHash` | 2 | `commitment_hashes` is empty, or any hash is all zeros |
+| `CommitmentAlreadyRegistered` | 3 | Any hash is already registered (including duplicates within the same batch) |
+
+### Auth Model
+
+No caller authorization is required. The submitter's identity is intentionally not recorded on-chain.
+
+### Events
+
+One event is emitted per commitment hash:
+
+- **Topics:** `(symbol_short!("ip_commit_anon"), contract_address)`
+- **Data:** `(ip_id: u64, timestamp: u64, blinded_owner: BytesN<32>)`
+
+### Storage
+
+Per commitment hash, two persistent storage keys are written:
+
+| Key | Value | Purpose |
+|---|---|---|
+| `CommitmentOwner(hash)` | contract address | Global duplicate guard |
+| `AnonymousOwner(hash)` | `blinded_owner` | Ownership proof pointer |
+
+Anonymous commits do **not** populate `OwnerIps` — they will not appear in `list_ip_by_owner` for any address.
+
+### Example (Rust SDK)
+
+```rust
+// Construct blinded owner: sha256(real_owner_bytes || random_nonce)
+let mut preimage = Bytes::new(&env);
+preimage.append(&owner_bytes);
+preimage.append(&nonce_bytes);
+let blinded_owner: BytesN<32> = env.crypto().sha256(&preimage).into();
+
+let hashes = Vec::from_array(&env, [hash1, hash2]);
+let ip_ids = registry.batch_commit_ip_anonymous(&blinded_owner, &hashes);
+// ip_ids = [1, 2]
+```
+
+### Example (REST API)
+
+**POST** `/ip/batch/anonymous`
+
+**Request Body:**
+```json
+{
+  "blinded_owner": "a1b2c3d4...",
+  "commitment_hashes": [
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9"
+  ]
+}
+```
+
+**Response (200 OK):**
+```json
+[1, 2]
+```
+
+---
+
+## `get_anonymous_owner`
+
+Retrieve the blinded owner identifier stored for an anonymous commitment.
+
+### Signature
+
+```rust
+pub fn get_anonymous_owner(env: Env, commitment_hash: BytesN<32>) -> Option<BytesN<32>>
+```
+
+### Parameters
+
+| Parameter | Type | Description |
+|---|---|---|
+| `env` | `Env` | Soroban environment |
+| `commitment_hash` | `BytesN<32>` | The commitment hash to look up |
+
+### Returns
+
+`Option<BytesN<32>>` — The blinded owner identifier if the hash was registered via `batch_commit_ip_anonymous`, or `None` if no anonymous owner record exists (e.g. the hash was committed via `commit_ip`).
+
+### Panics
+
+This function does not panic.
+
+### Example (Rust SDK)
+
+```rust
+let blinded = registry.get_anonymous_owner(&commitment_hash);
+match blinded {
+    Some(b) => println!("Blinded owner: {:?}", b),
+    None => println!("Not an anonymous commitment"),
+}
+```
+
+---
+
+
 ## `get_ip`
 
 Retrieve an IP record by ID.
