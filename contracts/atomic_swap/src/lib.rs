@@ -2784,6 +2784,10 @@ impl AtomicSwap {
                     );
                 }
             }
+
+            // Update reputation on batch completion
+            Self::update_reputation(&env, &swap.seller, 5);
+            Self::update_reputation(&env, &swap.buyer, 5);
         }
 
         env.events().publish(
