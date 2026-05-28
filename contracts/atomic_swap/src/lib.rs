@@ -2670,6 +2670,19 @@ impl AtomicSwap {
                 &swap.price,
             );
 
+            // #354: Collect insurance premium from buyer and add to pool.
+            if swap.insurance_enabled && swap.insurance_premium > 0 {
+                token_client.transfer(
+                    &swap.buyer,
+                    &env.current_contract_address(),
+                    &swap.insurance_premium,
+                );
+                let pool_key = DataKey::InsurancePool(swap.token.clone());
+                let pool: i128 = env.storage().persistent().get(&pool_key).unwrap_or(0);
+                env.storage().persistent().set(&pool_key, &(pool + swap.insurance_premium));
+                env.storage().persistent().extend_ttl(&pool_key, LEDGER_BUMP, LEDGER_BUMP);
+            }
+
             swap.accept_timestamp = env.ledger().timestamp();
             swap.status = SwapStatus::Accepted;
             swap::save_swap(&env, swap_id, &swap);
@@ -2797,6 +2810,100 @@ impl AtomicSwap {
                 seller,
             },
         );
+    }
+
+    /// Seller initiates multiple patent sales with optional insurance. Returns a Vec of swap IDs.
+    /// When `insurance_enabled` is true, each swap's premium is set to 2% of its price and
+    /// collected from the buyer at `batch_accept_swaps` time.
+    pub fn batch_initiate_swap_with_insurance(
+        env: Env,
+        token: Address,
+        ip_ids: Vec<u64>,
+        seller: Address,
+        prices: Vec<i128>,
+        buyer: Address,
+        required_approvals: u32,
+        referrer: Option<Address>,
+        insurance_enabled: bool,
+    ) -> Vec<u64> {
+        require_not_paused(&env);
+        seller.require_auth();
+
+        let len = ip_ids.len();
+        let mut swap_ids: Vec<u64> = Vec::new(&env);
+
+        for i in 0..len {
+            let ip_id = ip_ids.get(i).unwrap();
+            let price = prices.get(i).unwrap();
+
+            require_positive_price(&env, price);
+            registry::ensure_seller_owns_active_ip(&env, ip_id, &seller);
+            require_no_active_swap(&env, ip_id);
+
+            let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(0);
+            let insurance_premium = if insurance_enabled { price * 2 / 100 } else { 0 };
+
+            let swap = SwapRecord {
+                ip_id,
+                seller: seller.clone(),
+                buyer: buyer.clone(),
+                price,
+                token: token.clone(),
+                status: SwapStatus::Pending,
+                expiry: env.ledger().timestamp() + 604800u64,
+                accept_timestamp: 0,
+                required_approvals,
+                dispute_timestamp: 0,
+                referrer: referrer.clone(),
+                collateral_amount: 0,
+                insurance_premium,
+                insurance_enabled,
+                escrow_agent: None,
+                quantity: 1,
+                conditions: Vec::new(&env),
+                paid_amount: 0,
+                is_installment: false,
+            };
+
+            if insurance_enabled {
+                env.storage().persistent().set(&DataKey::SwapInsurance(id), &insurance_premium);
+                env.storage().persistent().extend_ttl(&DataKey::SwapInsurance(id), LEDGER_BUMP, LEDGER_BUMP);
+            }
+
+            env.storage().persistent().set(&DataKey::Swap(id), &swap);
+            env.storage().persistent().extend_ttl(&DataKey::Swap(id), LEDGER_BUMP, LEDGER_BUMP);
+            env.storage().persistent().set(&DataKey::ActiveSwap(ip_id), &id);
+            env.storage().persistent().extend_ttl(&DataKey::ActiveSwap(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+            swap::append_swap_for_party(&env, &seller, &buyer, id);
+
+            let mut ip_swap_ids: Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::IpSwaps(ip_id))
+                .unwrap_or(Vec::new(&env));
+            ip_swap_ids.push_back(id);
+            env.storage().persistent().set(&DataKey::IpSwaps(ip_id), &ip_swap_ids);
+            env.storage().persistent().extend_ttl(&DataKey::IpSwaps(ip_id), 50000, 50000);
+
+            Self::append_history(&env, id, SwapStatus::Pending);
+            env.storage().instance().set(&DataKey::NextId, &(id + 1));
+
+            env.events().publish(
+                (soroban_sdk::symbol_short!("swap_init"),),
+                SwapInitiatedEvent {
+                    swap_id: id,
+                    ip_id,
+                    seller: seller.clone(),
+                    buyer: buyer.clone(),
+                    price,
+                },
+            );
+
+            swap_ids.push_back(id);
+        }
+
+        swap_ids
     }
 
     // ── #358: Swap Timeout Escalation ─────────────────────────────────────────
