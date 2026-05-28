@@ -85,6 +85,8 @@ pub enum DataKey {
     OwnerIps(Address),
     NextId,
     CommitmentOwner(BytesN<32>), // tracks which owner already holds a commitment hash
+    /// Maps commitment hash -> blinded owner identifier for anonymous commits
+    AnonymousOwner(BytesN<32>),
     Admin,
     PartialDisclosure(u64), // stores partial_hash for a given ip_id after reveal
     IpLicenses(u64),        // stores license entries for a given ip_id
@@ -101,19 +103,7 @@ pub enum DataKey {
     EncryptionKeyRotation(u64), // Issue #434: stores rotation history for a given ip_id
     NotaryPublicKey,        // Issue #428: stores the trusted notary Ed25519 public key (32 bytes)
     CommitmentHashes,       // Issue #429: stores Vec<BytesN<32>> of all commitment hashes for rollback protection
-    ShardIps(u32),          // Issue #437: stores Vec<u64> of IP IDs in a given shard
-    CompressedCommitment(u64), // Issue #438: stores BytesN<16> compressed commitment for an IP
-    IpAuditTrail(u64),      // Issue #436: stores Vec<AuditEntry> for an IP
-    IpDisputes(u64),        // stores DisputeRecord for a given dispute_id
-    NextDisputeId,          // monotonic dispute ID counter
-    IpStake(u64),           // Issue #447: stores StakeRecord for an IP
-    OwnerReputation(Address), // Issue #448: stores ReputationRecord for an owner
-    ArbitratorPool,         // Issue #449: stores Vec<Address> of nominated arbitrators
-    ArbitrationCase(u64),   // Issue #449: stores ArbitrationRecord for a given arbitration_id
-    NextArbitrationId,      // Issue #449: monotonic arbitration ID counter
-    RenewalCount(u64),      // number of times an IP commitment has been renewed
-    Delegates(Address),     // delegation chains: stores Vec<DelegationRecord> for an owner
-    DelegateDepth(Address), // depth of a delegate in the chain (0 = direct delegate of root)
+    IpPowDifficulty(u64),   // stores the pow_difficulty used at commit time for strength scoring
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -318,6 +308,16 @@ impl IpRegistry {
             .persistent()
             .extend_ttl(&DataKey::IpRecord(id), LEDGER_BUMP, LEDGER_BUMP);
 
+        // Store pow_difficulty for strength scoring (Issue: entropy/complexity scoring)
+        env.storage()
+            .persistent()
+            .set(&DataKey::IpPowDifficulty(id), &pow_difficulty);
+        env.storage().persistent().extend_ttl(
+            &DataKey::IpPowDifficulty(id),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
         // Append to owner index
         let mut ids: Vec<u64> = env
             .storage()
@@ -498,6 +498,168 @@ impl IpRegistry {
         Self::update_commitment_checksum(&env);
 
         ids
+    }
+
+    /// Commit multiple IP commitments anonymously in a single transaction.
+    ///
+    /// Stores a blinded owner identifier alongside each commitment so ownership
+    /// can be proven off-chain or revealed later without exposing the on-chain
+    /// owner address at commit time. The on-chain `IpRecord.owner` is set to
+    /// the contract address as a placeholder to avoid leaking the submitter.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `blinded_owner` - A 32-byte blinded owner identifier (e.g. `sha256(owner || nonce)`).
+    ///   Stored on-chain per commitment so ownership can be proved or revealed later.
+    /// * `commitment_hashes` - Non-empty vector of 32-byte commitment hashes to register.
+    ///   Each must not be all zeros and must be globally unique.
+    ///
+    /// # Returns
+    ///
+    /// `Vec<u64>` — Assigned IP IDs in the same order as the input hashes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// * `commitment_hashes` is empty (panics with `ZeroCommitmentHash` on the first iteration
+    ///   — callers should not pass an empty vector)
+    /// * Any `commitment_hash` is all zeros (`ZeroCommitmentHash` error, code 2)
+    /// * Any `commitment_hash` is already registered (`CommitmentAlreadyRegistered` error, code 3)
+    ///
+    /// # Auth Model
+    ///
+    /// No caller authorization is required. The submitter's identity is intentionally
+    /// not recorded on-chain; only the `blinded_owner` identifier is stored.
+    ///
+    /// # Events
+    ///
+    /// Emits one `"ip_commit_anon"` event per commitment:
+    /// - Topics: `(symbol_short!("ip_commit_anon"), contract_address)`
+    /// - Data: `(ip_id: u64, timestamp: u64, blinded_owner: BytesN<32>)`
+    ///
+    /// # Storage
+    ///
+    /// Per commitment hash, two persistent keys are written:
+    /// - `DataKey::CommitmentOwner(hash)` → contract address (duplicate guard)
+    /// - `DataKey::AnonymousOwner(hash)` → `blinded_owner` (ownership proof pointer)
+    pub fn batch_commit_ip_anonymous(
+        env: Env,
+        blinded_owner: BytesN<32>,
+        commitment_hashes: Vec<BytesN<32>>,
+    ) -> Vec<u64> {
+        // No caller auth required for anonymous commits.
+
+        // Reject empty batch — nothing to commit.
+        if commitment_hashes.is_empty() {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::ZeroCommitmentHash as u32,
+            ));
+        }
+
+        // Initialize admin on first call if not set
+        if !env.storage().persistent().has(&DataKey::Admin) {
+            let admin = env.current_contract_address();
+            env.storage().persistent().set(&DataKey::Admin, &admin);
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::Admin, 50000, 50000);
+        }
+
+        let mut ids = Vec::new(&env);
+        let timestamp = env.ledger().timestamp();
+
+        for commitment_hash in commitment_hashes.iter() {
+            // Reject zero-byte commitment hash
+            require_non_zero_commitment(&env, &commitment_hash);
+
+            // Reject duplicate commitment hash globally
+            require_unique_commitment(&env, &commitment_hash);
+
+            // NextId lives in persistent storage so it survives contract upgrades.
+            let id: u64 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::NextId)
+                .unwrap_or(1);
+
+            let record = IpRecord {
+                ip_id: id,
+                owner: env.current_contract_address(),
+                commitment_hash: commitment_hash.clone(),
+                timestamp,
+                revoked: false,
+                co_owners: Vec::new(&env),
+                parent_ip_id: None,
+                notary_signature: None,
+            };
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::IpRecord(id), &record);
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::IpRecord(id), LEDGER_BUMP, LEDGER_BUMP);
+
+            // Do NOT append to OwnerIps index to preserve anonymity.
+
+            // Track commitment hash ownership to prevent duplicates
+            env.storage()
+                .persistent()
+                .set(&DataKey::CommitmentOwner(commitment_hash.clone()), &env.current_contract_address());
+            env.storage().persistent().extend_ttl(
+                &DataKey::CommitmentOwner(commitment_hash.clone()),
+                50000,
+                50000,
+            );
+
+            // Record blinded owner mapping for later on-chain/off-chain proof if needed.
+            env.storage()
+                .persistent()
+                .set(&DataKey::AnonymousOwner(commitment_hash.clone()), &blinded_owner);
+            env.storage().persistent().extend_ttl(
+                &DataKey::AnonymousOwner(commitment_hash.clone()),
+                LEDGER_BUMP,
+                LEDGER_BUMP,
+            );
+
+            env.events().publish(
+                (symbol_short!("ip_commit_anon"), env.current_contract_address()),
+                (id, timestamp, blinded_owner.clone()),
+            );
+
+            ids.push_back(id);
+
+            env.storage().persistent().set(&DataKey::NextId, &(id + 1));
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::NextId, LEDGER_BUMP, LEDGER_BUMP);
+        }
+
+        // Issue #346: Update commitment checksum for rollback protection
+        Self::update_commitment_checksum(&env);
+
+        ids
+    }
+
+    /// Retrieve the blinded owner identifier stored for an anonymous commitment.
+    ///
+    /// Returns `Some(blinded_owner)` if the commitment was registered via
+    /// `batch_commit_ip_anonymous`, or `None` if no anonymous owner record exists
+    /// for the given hash (e.g. it was committed via `commit_ip` or `batch_commit_ip`).
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `commitment_hash` - The 32-byte commitment hash to look up
+    ///
+    /// # Returns
+    ///
+    /// `Option<BytesN<32>>` — The blinded owner identifier, or `None`.
+    pub fn get_anonymous_owner(env: Env, commitment_hash: BytesN<32>) -> Option<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AnonymousOwner(commitment_hash))
     }
 
     /// Transfer IP ownership to a new address.
@@ -782,6 +944,50 @@ impl IpRegistry {
             .persistent()
             .get(&DataKey::PowDifficulty)
             .unwrap_or(4u32)
+    }
+
+    /// Returns the entropy-and-complexity strength score (0–100) for an IP commitment.
+    ///
+    /// The score combines:
+    /// - **Byte entropy**: number of unique bytes in the 32-byte commitment hash,
+    ///   scaled to 0–50 (max 32 unique bytes → 50 points).
+    /// - **PoW difficulty**: the `pow_difficulty` used at commit time, scaled to 0–50
+    ///   (each difficulty bit contributes ~1.5625 points, capped at 50).
+    ///
+    /// Weak commitments (e.g. all-same-byte hashes or zero PoW) score low; strong,
+    /// high-entropy commitments with meaningful PoW score near 100.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `IpNotFound` if the IP does not exist.
+    pub fn get_ip_strength(env: Env, ip_id: u64) -> u32 {
+        let record = require_ip_exists(&env, ip_id);
+        let pow_difficulty: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IpPowDifficulty(ip_id))
+            .unwrap_or(0u32);
+
+        let hash_bytes = record.commitment_hash.to_array();
+
+        // Count unique bytes as a proxy for byte-level entropy (0–32 unique values)
+        let mut seen = [false; 256];
+        for b in hash_bytes.iter() {
+            seen[*b as usize] = true;
+        }
+        let unique_bytes = seen.iter().filter(|&&v| v).count() as u32;
+
+        // Scale unique_bytes (0–32) to 0–50
+        let entropy_score = (unique_bytes * 50) / 32;
+
+        // Scale pow_difficulty to 0–50 (32 bits max → 50 points)
+        let pow_score = if pow_difficulty >= 32 {
+            50u32
+        } else {
+            (pow_difficulty * 50) / 32
+        };
+
+        (entropy_score + pow_score).min(100)
     }
 
     /// Returns the current protocol configuration.
@@ -1576,13 +1782,23 @@ impl IpRegistry {
 
     // ── Issue #344: Tiered Access Control ──────────────────────────────────────
 
-    /// Grant access to an IP for a third party. Owner-only.
-    /// access_level: 0 = none, 1 = read-only, 2 = read-write
+    /// Grant tiered access to an IP for a third party. Owner-only.
+    ///
+    /// Access tiers are hierarchical — a higher tier implies all lower tiers:
+    /// - `1` = **view**: read IP metadata
+    /// - `2` = **verify**: view + verify the commitment
+    /// - `3` = **transfer**: view + verify + initiate transfer
+    ///
+    /// Granting to an address that already has a grant updates the level.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `Unauthorized` if `access_level` is 0 or > 3, or if caller is not the owner.
     pub fn grant_ip_access(env: Env, ip_id: u64, grantee: Address, access_level: u32) {
         let record = require_ip_exists(&env, ip_id);
         record.owner.require_auth();
 
-        if access_level > 2 {
+        if access_level < 1 || access_level > 3 {
             env.panic_with_error(Error::from_contract_error(ContractError::Unauthorized as u32));
         }
 
@@ -1601,7 +1817,7 @@ impl IpRegistry {
             }
         }
         if !found {
-            grants.push_back(IpAccessGrant { grantee, access_level });
+            grants.push_back(IpAccessGrant { grantee: grantee.clone(), access_level });
         }
 
         env.storage()
@@ -1612,9 +1828,15 @@ impl IpRegistry {
             LEDGER_BUMP,
             LEDGER_BUMP,
         );
+
+        env.events().publish(
+            (symbol_short!("ac_grant"), ip_id),
+            (grantee, access_level),
+        );
     }
 
     /// Revoke access to an IP from a third party. Owner-only.
+    /// No-op if the grantee has no grant.
     pub fn revoke_ip_access(env: Env, ip_id: u64, grantee: Address) {
         let record = require_ip_exists(&env, ip_id);
         record.owner.require_auth();
@@ -1635,6 +1857,11 @@ impl IpRegistry {
                 LEDGER_BUMP,
                 LEDGER_BUMP,
             );
+
+            env.events().publish(
+                (symbol_short!("ac_revoke"), ip_id),
+                grantee,
+            );
         }
     }
 
@@ -1645,6 +1872,31 @@ impl IpRegistry {
             .persistent()
             .get(&DataKey::IpAccessGrants(ip_id))
             .unwrap_or(Vec::new(&env))
+    }
+
+    /// Check whether `grantee` has at least `required_level` access to `ip_id`.
+    ///
+    /// The owner always has full access (level 3). Tiers are hierarchical:
+    /// a grantee with level 3 satisfies a check for level 1 or 2.
+    ///
+    /// Returns `true` if access is granted, `false` otherwise.
+    pub fn check_ip_access(env: Env, ip_id: u64, grantee: Address, required_level: u32) -> bool {
+        let record = require_ip_exists(&env, ip_id);
+        // Owner always has full access
+        if grantee == record.owner {
+            return true;
+        }
+        let grants: Vec<IpAccessGrant> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IpAccessGrants(ip_id))
+            .unwrap_or(Vec::new(&env));
+        for grant in grants.iter() {
+            if grant.grantee == grantee {
+                return grant.access_level >= required_level;
+            }
+        }
+        false
     }
 
     // ── Issue #345 / #428: Timestamp Notarization ──────────────────────────────
