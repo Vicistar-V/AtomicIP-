@@ -128,6 +128,135 @@ let ip_ids = registry.batch_commit_ip(&owner, &hashes);
 
 ---
 
+## `batch_commit_ip_anonymous`
+
+Commit multiple IP hashes anonymously in a single transaction. The contract stores a blinded owner identifier alongside each commitment; the on-chain `owner` field is set to the contract address to avoid exposing the submitter.
+
+### Signature
+
+```rust
+pub fn batch_commit_ip_anonymous(
+    env: Env,
+    blinded_owner: BytesN<32>,
+    commitment_hashes: Vec<BytesN<32>>,
+) -> Vec<u64>
+```
+
+### Parameters
+
+| Parameter | Type | Description |
+|---|---|---|
+| `env` | `Env` | Soroban environment |
+| `blinded_owner` | `BytesN<32>` | Off-chain blinded owner identifier (e.g. `sha256(owner \|\| nonce)`). Stored per commitment for later ownership proof. |
+| `commitment_hashes` | `Vec<BytesN<32>>` | Non-empty vector of commitment hashes to register anonymously. |
+
+### Returns
+
+`Vec<u64>` — Assigned sequential IP IDs in the same order as the input hashes.
+
+### Panics
+
+| Error | Code | Condition |
+|---|---|---|
+| `ZeroCommitmentHash` | 2 | `commitment_hashes` is empty, or any hash is all zeros |
+| `CommitmentAlreadyRegistered` | 3 | Any hash is already registered (including duplicates within the same batch) |
+
+### Auth Model
+
+No caller authorization is required. The submitter's identity is intentionally not recorded on-chain.
+
+### Events
+
+One event is emitted per commitment hash:
+
+- **Topics:** `(symbol_short!("ip_commit_anon"), contract_address)`
+- **Data:** `(ip_id: u64, timestamp: u64, blinded_owner: BytesN<32>)`
+
+### Storage
+
+Per commitment hash, two persistent storage keys are written:
+
+| Key | Value | Purpose |
+|---|---|---|
+| `CommitmentOwner(hash)` | contract address | Global duplicate guard |
+| `AnonymousOwner(hash)` | `blinded_owner` | Ownership proof pointer |
+
+Anonymous commits do **not** populate `OwnerIps` — they will not appear in `list_ip_by_owner` for any address.
+
+### Example (Rust SDK)
+
+```rust
+// Construct blinded owner: sha256(real_owner_bytes || random_nonce)
+let mut preimage = Bytes::new(&env);
+preimage.append(&owner_bytes);
+preimage.append(&nonce_bytes);
+let blinded_owner: BytesN<32> = env.crypto().sha256(&preimage).into();
+
+let hashes = Vec::from_array(&env, [hash1, hash2]);
+let ip_ids = registry.batch_commit_ip_anonymous(&blinded_owner, &hashes);
+// ip_ids = [1, 2]
+```
+
+### Example (REST API)
+
+**POST** `/ip/batch/anonymous`
+
+**Request Body:**
+```json
+{
+  "blinded_owner": "a1b2c3d4...",
+  "commitment_hashes": [
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9"
+  ]
+}
+```
+
+**Response (200 OK):**
+```json
+[1, 2]
+```
+
+---
+
+## `get_anonymous_owner`
+
+Retrieve the blinded owner identifier stored for an anonymous commitment.
+
+### Signature
+
+```rust
+pub fn get_anonymous_owner(env: Env, commitment_hash: BytesN<32>) -> Option<BytesN<32>>
+```
+
+### Parameters
+
+| Parameter | Type | Description |
+|---|---|---|
+| `env` | `Env` | Soroban environment |
+| `commitment_hash` | `BytesN<32>` | The commitment hash to look up |
+
+### Returns
+
+`Option<BytesN<32>>` — The blinded owner identifier if the hash was registered via `batch_commit_ip_anonymous`, or `None` if no anonymous owner record exists (e.g. the hash was committed via `commit_ip`).
+
+### Panics
+
+This function does not panic.
+
+### Example (Rust SDK)
+
+```rust
+let blinded = registry.get_anonymous_owner(&commitment_hash);
+match blinded {
+    Some(b) => println!("Blinded owner: {:?}", b),
+    None => println!("Not an anonymous commitment"),
+}
+```
+
+---
+
+
 ## `get_ip`
 
 Retrieve an IP record by ID.
@@ -513,170 +642,87 @@ See [TTL_MANAGEMENT.md](../TTL_MANAGEMENT.md) for details.
 
 ---
 
-## Issue #450: Anonymous IP Commitment
+## Tiered Access Control
 
-### `commit_ip_anonymous`
+IP owners can grant other addresses tiered read/verify/transfer access without transferring ownership.
 
-Commit an IP anonymously using a ZK-style nullifier. The owner's identity is not stored — only the nullifier and commitment hash are recorded.
+### Access Tiers
+
+| Level | Name | Permissions |
+|---|---|---|
+| `1` | **view** | Read IP metadata |
+| `2` | **verify** | View + verify the commitment |
+| `3` | **transfer** | View + verify + initiate transfer |
+
+Tiers are hierarchical: a grantee with level 3 satisfies checks for levels 1 and 2. The owner always has full access (level 3) regardless of grants.
+
+---
+
+### `grant_ip_access`
+
+Grant tiered access to an IP for a third party. Owner-only. Granting to an address that already has a grant updates the level.
 
 ```rust
-pub fn commit_ip_anonymous(
-    env: Env,
-    nullifier: BytesN<32>,
-    commitment_hash: BytesN<32>,
-    anonymity_set_id: BytesN<32>,
-) -> BytesN<32>
+pub fn grant_ip_access(env: Env, ip_id: u64, grantee: Address, access_level: u32)
 ```
 
 | Parameter | Type | Description |
 |---|---|---|
-| `nullifier` | `BytesN<32>` | Unique value derived from `sha256(secret \|\| nonce)` — prevents double-spend |
-| `commitment_hash` | `BytesN<32>` | The IP commitment hash |
-| `anonymity_set_id` | `BytesN<32>` | Group ID for the anonymity set this commitment joins |
+| `ip_id` | `u64` | The IP to grant access to |
+| `grantee` | `Address` | The address receiving access |
+| `access_level` | `u32` | `1` = view, `2` = verify, `3` = transfer |
 
-**Returns:** The nullifier (for reference).
+**Panics:** `Unauthorized` (6) if `access_level` is 0 or > 3, or caller is not the owner.
 
-**Errors:** `ZeroCommitmentHash` (2) if either input is zero. `NullifierAlreadyUsed` (24) if the nullifier was already submitted.
-
-### `get_anonymous_commitment`
+**Event:** `(symbol_short!("ac_grant"), ip_id)` → `(grantee, access_level)`
 
 ```rust
-pub fn get_anonymous_commitment(env: Env, nullifier: BytesN<32>) -> AnonymousCommitmentRecord
+// Grant verify access to a partner
+registry.grant_ip_access(&ip_id, &partner, &2u32);
 ```
-
-Retrieve an anonymous commitment record by its nullifier.
-
-### `get_anonymity_set`
-
-```rust
-pub fn get_anonymity_set(env: Env, anonymity_set_id: BytesN<32>) -> Vec<BytesN<32>>
-```
-
-Returns all commitment hashes in the given anonymity set.
-
-### `is_nullifier_used`
-
-```rust
-pub fn is_nullifier_used(env: Env, nullifier: BytesN<32>) -> bool
-```
-
-Returns `true` if the nullifier has already been used (double-spend check).
 
 ---
 
-## Issue #451: Batch Revocation
+### `revoke_ip_access`
 
-### `batch_revoke_ip`
-
-Revoke multiple IP commitments in a single transaction. Already-revoked IPs and IPs not owned by the caller are silently skipped.
+Revoke access from a grantee. Owner-only. No-op if the grantee has no grant.
 
 ```rust
-pub fn batch_revoke_ip(env: Env, owner: Address, ip_ids: Vec<u64>) -> u32
+pub fn revoke_ip_access(env: Env, ip_id: u64, grantee: Address)
 ```
 
-| Parameter | Type | Description |
-|---|---|---|
-| `owner` | `Address` | Owner of the IPs — must authorize the transaction |
-| `ip_ids` | `Vec<u64>` | List of IP IDs to revoke |
+**Event:** `(symbol_short!("ac_revoke"), ip_id)` → `grantee`
 
-**Returns:** Number of IPs newly revoked in this call.
-
-**Errors:** `EmptyBatchRevocation` (26) if `ip_ids` is empty.
-
-**Authorization:** Requires `owner.require_auth()`.
+```rust
+registry.revoke_ip_access(&ip_id, &partner);
+```
 
 ---
 
-## Issue #452: Conditional Verification
+### `check_ip_access`
 
-### `set_verification_condition`
-
-Set a condition that must be met before an IP commitment can be verified.
+Check whether an address has at least the required access level for an IP.
 
 ```rust
-pub fn set_verification_condition(env: Env, ip_id: u64, condition: VerificationCondition)
+pub fn check_ip_access(env: Env, ip_id: u64, grantee: Address, required_level: u32) -> bool
 ```
 
-| Condition Variant | Description |
-|---|---|
-| `VerificationCondition::None` | No restriction — always verifiable |
-| `VerificationCondition::TimeAfter(u64)` | Only verifiable after the given ledger timestamp |
-| `VerificationCondition::TimeBefore(u64)` | Only verifiable before the given ledger timestamp |
-
-**Authorization:** Requires the IP owner to authorize.
-
-### `get_verification_condition`
+Returns `true` if the grantee's level ≥ `required_level`, or if `grantee` is the owner.
 
 ```rust
-pub fn get_verification_condition(env: Env, ip_id: u64) -> VerificationCondition
+if registry.check_ip_access(&ip_id, &caller, &2u32) {
+    // caller can verify the commitment
+}
 ```
-
-Returns the current condition for an IP. Returns `VerificationCondition::None` if none is set.
-
-### `verify_commitment_conditional`
-
-```rust
-pub fn verify_commitment_conditional(
-    env: Env,
-    ip_id: u64,
-    secret: BytesN<32>,
-    blinding_factor: BytesN<32>,
-) -> bool
-```
-
-Verifies the commitment only if the set condition is satisfied. Panics with `ConditionNotMet` (27) if the condition fails.
 
 ---
 
-## Issue #453: IP Commitment Escrow
+### `get_ip_access_grants`
 
-### `place_in_escrow`
-
-Place an IP commitment into escrow. The IP will be transferred to the beneficiary once the release condition is met.
+Return all active access grants for an IP.
 
 ```rust
-pub fn place_in_escrow(
-    env: Env,
-    ip_id: u64,
-    beneficiary: Address,
-    release_condition: VerificationCondition,
-)
+pub fn get_ip_access_grants(env: Env, ip_id: u64) -> Vec<IpAccessGrant>
 ```
 
-| Parameter | Type | Description |
-|---|---|---|
-| `ip_id` | `u64` | The IP to escrow |
-| `beneficiary` | `Address` | Recipient when conditions are met |
-| `release_condition` | `VerificationCondition` | Condition for release (use `None` for immediate release) |
-
-**Errors:** `EscrowAlreadyExists` (29) if an escrow already exists for this IP.
-
-**Authorization:** Requires the IP owner to authorize.
-
-### `release_escrow`
-
-```rust
-pub fn release_escrow(env: Env, ip_id: u64)
-```
-
-Releases the escrowed IP to the beneficiary if the release condition is met. Anyone can call this once conditions are satisfied.
-
-**Errors:** `EscrowNotFound` (30), `EscrowConditionsNotMet` (31).
-
-### `cancel_escrow`
-
-```rust
-pub fn cancel_escrow(env: Env, ip_id: u64)
-```
-
-Cancels the escrow and returns control to the original owner. Only the original owner can cancel.
-
-**Authorization:** Requires the original escrow owner to authorize.
-
-### `get_escrow`
-
-```rust
-pub fn get_escrow(env: Env, ip_id: u64) -> EscrowRecord
-```
-
-Returns the escrow record for an IP. Panics with `EscrowNotFound` (30) if none exists.
+Returns a `Vec<IpAccessGrant>` where each entry has `grantee: Address` and `access_level: u32`.
