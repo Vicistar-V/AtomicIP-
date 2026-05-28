@@ -113,6 +113,49 @@
             "key": {
               "vec": [
                 {
+                  "symbol": "CommitmentHashes"
+                }
+              ]
+            },
+            "durability": "persistent"
+          }
+        },
+        [
+          {
+            "last_modified_ledger_seq": 0,
+            "data": {
+              "contract_data": {
+                "ext": "v0",
+                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+                "key": {
+                  "vec": [
+                    {
+                      "symbol": "CommitmentHashes"
+                    }
+                  ]
+                },
+                "durability": "persistent",
+                "val": {
+                  "vec": [
+                    {
+                      "bytes": "96bc917d05134ba810b71de80ffafc1e302f0174b9393de8e6d6d197a68289c1"
+                    }
+                  ]
+                }
+              }
+            },
+            "ext": "v0"
+          },
+          6307200
+        ]
+      ],
+      [
+        {
+          "contract_data": {
+            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "key": {
+              "vec": [
+                {
                   "symbol": "CommitmentOwner"
                 },
                 {
@@ -181,7 +224,7 @@
                 },
                 "durability": "persistent",
                 "val": {
-                  "bytes": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                  "bytes": "d0bcaf42704ff253fc601dc2ace17e097a6621000f6d4597c9f0c6029c47916d"
                 }
               }
             },

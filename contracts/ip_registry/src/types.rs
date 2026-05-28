@@ -42,6 +42,8 @@ pub enum DataKey {
     NextChallengeId,         // Issue #433: monotonic challenge ID counter
     EncryptionKeyRotation(u64), // Issue #434: stores Vec<BytesN<32>> of old commitment hashes
     MerkleRoot(Address),     // Issue #435: cached Merkle root for an owner's commitment set
+    NotaryPublicKey,         // Issue #428: stores the trusted notary Ed25519 public key (32 bytes)
+    CommitmentHashes,        // Issue #429: stores Vec<BytesN<32>> of all commitment hashes for rollback protection
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────

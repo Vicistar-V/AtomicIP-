@@ -51,6 +51,12 @@ pub enum ContractError {
     OnlyOwnerCanManageCoOwners = 15,
     DisputeNotFound = 16,
     DisputeAlreadyResolved = 17,
+    StakeNotFound = 18,
+    AlreadyStaked = 19,
+    StakeAlreadySlashed = 20,
+    ArbitrationNotFound = 21,
+    ArbitrationAlreadyFinalized = 22,
+    NotAnArbitrator = 23,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -93,14 +99,8 @@ pub enum DataKey {
     OwnershipChallenge(u64), // Issue #433: stores OwnershipChallenge for a given challenge_id
     NextChallengeId,         // Issue #433: monotonic challenge ID counter
     EncryptionKeyRotation(u64), // Issue #434: stores rotation history for a given ip_id
-    CompressedCommitment(u64),  // Issue #438: stores compressed (16-byte) commitment hash
-    ShardIps(u32),              // Issue #437: stores Vec<u64> of IP IDs in a given shard
-    IpAuditTrail(u64),          // Issue #436: stores Vec<AuditEntry> for a given ip_id
-    IpDisputes(u64),            // stores DisputeRecord for a given dispute_id
-    NextDisputeId,              // monotonic dispute ID counter
-    Snapshot(u64),              // stores CommitmentSnapshot for a given snapshot_id
-    NextSnapshotId,             // monotonic snapshot ID counter
-    CommitmentChecksumV2,       // stores checksum computed over all active commitment hashes
+    NotaryPublicKey,        // Issue #428: stores the trusted notary Ed25519 public key (32 bytes)
+    CommitmentHashes,       // Issue #429: stores Vec<BytesN<32>> of all commitment hashes for rollback protection
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -162,14 +162,37 @@ pub struct DisputeRecord {
     pub winner: Option<Address>,
 }
 
-/// A periodic snapshot of all active commitment hashes for disaster recovery.
+/// Issue #447: Stake record for an IP commitment.
 #[contracttype]
 #[derive(Clone)]
-pub struct CommitmentSnapshot {
-    pub snapshot_id: u64,
-    pub timestamp: u64,
-    pub total_count: u64,
-    pub checksum: BytesN<32>,
+pub struct StakeRecord {
+    pub ip_id: u64,
+    pub owner: Address,
+    pub amount: i128,
+    pub slashed: bool,
+}
+
+/// Issue #448: Reputation record for an IP owner.
+#[contracttype]
+#[derive(Clone)]
+pub struct ReputationRecord {
+    pub owner: Address,
+    pub score: i64,       // can go negative after slashing
+    pub commitments: u64, // total successful commitments
+    pub disputes_lost: u64,
+}
+
+/// Issue #449: Arbitration case for a dispute.
+#[contracttype]
+#[derive(Clone)]
+pub struct ArbitrationRecord {
+    pub arbitration_id: u64,
+    pub dispute_id: u64,
+    pub arbitrators: soroban_sdk::Vec<Address>,
+    pub votes_owner: u32,
+    pub votes_challenger: u32,
+    pub finalized: bool,
+    pub winner: Option<Address>,
 }
 
 // ── Contract ─────────────────────────────────────────────────────────────────
@@ -1268,6 +1291,27 @@ impl IpRegistry {
         Self::create_ip_version(env, parent_ip_id, commitment_hash)
     }
 
+    /// Get all direct child version IDs for a given IP.
+    ///
+    /// Returns the IDs of all IPs that were created as direct versions of `ip_id`
+    /// via `create_ip_version` or `commit_ip_version`. Does not include
+    /// grandchildren or deeper descendants.
+    ///
+    /// # Returns
+    ///
+    /// A `Vec<u64>` of direct child version IDs, or an empty vec if none exist.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the IP record does not exist (IpNotFound error).
+    pub fn get_ip_versions(env: Env, ip_id: u64) -> Vec<u64> {
+        require_ip_exists(&env, ip_id);
+        env.storage()
+            .persistent()
+            .get(&DataKey::IpVersions(ip_id))
+            .unwrap_or(Vec::new(&env))
+    }
+
     /// Retrieve the full version chain for an IP, rooted at the original.
     ///
     /// Returns a `Vec<u64>` starting with the root IP ID followed by all
@@ -1578,14 +1622,75 @@ impl IpRegistry {
             .unwrap_or(Vec::new(&env))
     }
 
-    // ── Issue #345: Timestamp Notarization ─────────────────────────────────────
+    // ── Issue #345 / #428: Timestamp Notarization ──────────────────────────────
 
-    /// Notarize an IP timestamp with a notary signature. Notary-only.
+    /// Set the trusted notary public key (Ed25519, 32 bytes). Admin-only.
+    ///
+    /// Must be called once after deployment to configure the notary public key
+    /// used to verify timestamp signatures.
+    pub fn set_notary_public_key(env: Env, public_key: BytesN<32>) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| env.current_contract_address());
+        admin.require_auth();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::NotaryPublicKey, &public_key);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::NotaryPublicKey, LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    /// Notarize an IP timestamp with a notary Ed25519 signature.
+    ///
+    /// The notary must sign the message `ip_id_be_bytes || timestamp_be_bytes`
+    /// (8 bytes each, big-endian) with the private key corresponding to the
+    /// stored notary public key. The 64-byte signature is verified on-chain.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// * The IP does not exist (IpNotFound error)
+    /// * The notary public key has not been set (Unauthorized error)
+    /// * The signature is not exactly 64 bytes (Unauthorized error)
+    /// * The Ed25519 signature verification fails (Unauthorized error)
     pub fn notarize_ip_timestamp(env: Env, ip_id: u64, notary_signature: Bytes) {
         let mut record = require_ip_exists(&env, ip_id);
 
-        // In production, verify notary_signature against NOTARY_PUBLIC_KEY
-        // For now, accept any signature (placeholder implementation)
+        // Require notary public key to be configured
+        let public_key: BytesN<32> = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::NotaryPublicKey)
+        {
+            Some(k) => k,
+            None => {
+                env.panic_with_error(Error::from_contract_error(ContractError::Unauthorized as u32));
+            }
+        };
+
+        // Signature must be exactly 64 bytes for Ed25519
+        if notary_signature.len() != 64 {
+            env.panic_with_error(Error::from_contract_error(ContractError::Unauthorized as u32));
+        }
+        let sig: BytesN<64> = match notary_signature.clone().try_into() {
+            Ok(s) => s,
+            Err(_) => {
+                env.panic_with_error(Error::from_contract_error(ContractError::Unauthorized as u32));
+            }
+        };
+
+        // Message: ip_id (8 bytes BE) || timestamp (8 bytes BE)
+        let mut message = Bytes::new(&env);
+        message.append(&Bytes::from_array(&env, &ip_id.to_be_bytes()));
+        message.append(&Bytes::from_array(&env, &record.timestamp.to_be_bytes()));
+
+        // Verify Ed25519 signature — panics if invalid
+        env.crypto().ed25519_verify(&public_key, &message, &sig);
+
         record.notary_signature = Some(notary_signature.clone());
 
         env.storage()
@@ -1632,26 +1737,61 @@ impl IpRegistry {
 
     // get_ip_disputes removed - IpDisputes DataKey variant not defined
 
-    // ── Issue #346: Commitment Rollback Protection ─────────────────────────────
+    // ── Issue #346 / #429: Commitment Rollback Protection ─────────────────────
 
     /// Compute and store a checksum of all commitments for rollback protection.
+    ///
+    /// Appends the latest commitment hash to the tracked list, then recomputes
+    /// the checksum as sha256 of all concatenated commitment hashes.
     fn update_commitment_checksum(env: &Env) {
-        // Get all commitment hashes from storage
-        // For simplicity, we compute a hash of all commitment hashes
-        let all_hashes = Bytes::new(env);
-
-        // This is a simplified implementation - in production, you'd iterate through all IPs
-        // For now, we'll store a placeholder checksum
-        let checksum: BytesN<32> = env.crypto().sha256(&all_hashes).into();
-
-        env.storage()
+        // Retrieve the current next ID to find the most recently added commitment
+        let next_id: u64 = env
+            .storage()
             .persistent()
-            .set(&DataKey::IpCommitmentChecksum, &checksum);
-        env.storage().persistent().extend_ttl(
-            &DataKey::IpCommitmentChecksum,
-            LEDGER_BUMP,
-            LEDGER_BUMP,
-        );
+            .get(&DataKey::NextId)
+            .unwrap_or(1);
+
+        // The last committed IP ID is next_id - 1 (if any IPs exist)
+        if next_id <= 1 {
+            return;
+        }
+        let last_id = next_id - 1;
+
+        // Get the commitment hash of the last committed IP
+        let last_record: Option<IpRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IpRecord(last_id));
+
+        if let Some(record) = last_record {
+            // Append to tracked commitment hashes list
+            let mut hashes: Vec<BytesN<32>> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::CommitmentHashes)
+                .unwrap_or(Vec::new(env));
+            hashes.push_back(record.commitment_hash);
+            env.storage()
+                .persistent()
+                .set(&DataKey::CommitmentHashes, &hashes);
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::CommitmentHashes, LEDGER_BUMP, LEDGER_BUMP);
+
+            // Recompute checksum: sha256 of all concatenated commitment hashes
+            let mut all_bytes = Bytes::new(env);
+            for h in hashes.iter() {
+                all_bytes.append(&h.into());
+            }
+            let checksum: BytesN<32> = env.crypto().sha256(&all_bytes).into();
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::IpCommitmentChecksum, &checksum);
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::IpCommitmentChecksum, LEDGER_BUMP, LEDGER_BUMP);
+        }
     }
 
     // ── Issue #439: Commitment Deduplication ──────────────────────────────────
@@ -1837,22 +1977,81 @@ impl IpRegistry {
     }
 
     /// Verify the integrity of all commitments (for upgrade safety).
+    ///
+    /// Recomputes the checksum from the tracked commitment hashes list and
+    /// compares it to the stored checksum. Returns `true` if they match.
     pub fn verify_commitment_integrity(env: Env) -> bool {
-        // Retrieve stored checksum
         let stored_checksum: Option<BytesN<32>> = env
             .storage()
             .persistent()
             .get(&DataKey::IpCommitmentChecksum);
 
         if stored_checksum.is_none() {
-            return true; // No checksum stored yet
+            return true; // No checksum stored yet — nothing to verify
         }
 
-        // Recompute checksum
-        let all_hashes = Bytes::new(&env);
-        let recomputed_checksum: BytesN<32> = env.crypto().sha256(&all_hashes).into();
+        let hashes: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CommitmentHashes)
+            .unwrap_or(Vec::new(&env));
 
-        stored_checksum.unwrap() == recomputed_checksum
+        let mut all_bytes = Bytes::new(&env);
+        for h in hashes.iter() {
+            all_bytes.append(&h.into());
+        }
+        let recomputed: BytesN<32> = env.crypto().sha256(&all_bytes).into();
+
+        stored_checksum.unwrap() == recomputed
+    }
+
+    // ── Issue #431: IP Claim Expiration Warnings ───────────────────────────────
+
+    /// Check if an IP commitment is approaching expiration and emit a warning event.
+    ///
+    /// Compares the remaining TTL of the IP record against `warning_threshold_ledgers`.
+    /// If the remaining TTL is less than or equal to the threshold, emits an
+    /// `exp_warn` event and returns `true`. Otherwise returns `false`.
+    ///
+    /// The TTL is estimated as `LEDGER_BUMP` minus ledgers elapsed since commitment
+    /// (using ledger sequence numbers as a proxy).
+    ///
+    /// # Arguments
+    ///
+    /// * `ip_id` - The IP to check
+    /// * `warning_threshold_ledgers` - Warn if remaining TTL ≤ this many ledgers
+    ///
+    /// # Returns
+    ///
+    /// `true` if the IP is approaching expiration, `false` otherwise.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the IP record does not exist (IpNotFound error).
+    pub fn check_expiration_warning(env: Env, ip_id: u64, warning_threshold_ledgers: u32) -> bool {
+        let record = require_ip_exists(&env, ip_id);
+
+        // Estimate remaining TTL: LEDGER_BUMP minus ledgers elapsed since commit.
+        // We use ledger sequence as a proxy for elapsed time.
+        // The record was committed at some ledger; we stored LEDGER_BUMP TTL at that point.
+        // Current sequence - commit sequence ≈ ledgers elapsed.
+        // Since we don't store the commit ledger sequence, we use timestamp difference
+        // as a proxy: elapsed_seconds / 5 ≈ elapsed_ledgers (5s per ledger).
+        let current_timestamp = env.ledger().timestamp();
+        let commit_timestamp = record.timestamp;
+        let elapsed_seconds = current_timestamp.saturating_sub(commit_timestamp);
+        let elapsed_ledgers = (elapsed_seconds / 5) as u32;
+        let remaining_ttl = LEDGER_BUMP.saturating_sub(elapsed_ledgers);
+
+        if remaining_ttl <= warning_threshold_ledgers {
+            env.events().publish(
+                (symbol_short!("exp_warn"), ip_id),
+                (record.owner, remaining_ttl),
+            );
+            return true;
+        }
+
+        false
     }
 
     // ── Issue #433: IP Ownership Proof Challenge ───────────────────────────────
@@ -2243,268 +2442,306 @@ impl IpRegistry {
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::DisputeNotFound))
     }
 
-    // ── Issue: Cleanup Expired/Revoked Commitments ────────────────────────────────────────
+    // ── Issue #447: IP Commitment Staking ─────────────────────────────────────
 
-    /// Remove a revoked IP record from storage to free ledger space.
-    ///
-    /// Only the owner may clean up their own revoked record. The commitment
-    /// owner index entry is also removed. Returns the ip_id that was cleaned.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the IP does not exist, the caller is not the owner, or the IP
-    /// is not revoked.
-    pub fn cleanup_revoked_commitment(env: Env, ip_id: u64) {
+    /// Stake XLM (represented as an i128 amount) against an IP commitment.
+    /// Only the IP owner may stake. One active stake per IP.
+    pub fn stake_commitment(env: Env, ip_id: u64, amount: i128) {
         let record = require_ip_exists(&env, ip_id);
         record.owner.require_auth();
-        require_is_revoked(&env, &record);
 
-        env.storage().persistent().remove(&DataKey::IpRecord(ip_id));
-        env.storage()
-            .persistent()
-            .remove(&DataKey::CommitmentOwner(record.commitment_hash.clone()));
-
-        let mut ids: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::OwnerIps(record.owner.clone()))
-            .unwrap_or(Vec::new(&env));
-        if let Some(pos) = ids.iter().position(|x| x == ip_id) {
-            ids.remove(pos as u32);
+        if env.storage().persistent().has(&DataKey::IpStake(ip_id)) {
+            panic_with_error!(&env, ContractError::AlreadyStaked);
         }
-        env.storage()
-            .persistent()
-            .set(&DataKey::OwnerIps(record.owner.clone()), &ids);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::OwnerIps(record.owner.clone()), LEDGER_BUMP, LEDGER_BUMP);
 
-        env.events().publish(
-            (symbol_short!("cleanup"), record.owner),
+        let stake = StakeRecord {
             ip_id,
-        );
+            owner: record.owner.clone(),
+            amount,
+            slashed: false,
+        };
+        env.storage().persistent().set(&DataKey::IpStake(ip_id), &stake);
+        env.storage().persistent().extend_ttl(&DataKey::IpStake(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish((symbol_short!("staked"), record.owner), (ip_id, amount));
     }
-}
 
+    /// Slash the stake for an IP (admin-only). Marks the stake as slashed and
+    /// decrements the owner's reputation score.
+    pub fn slash_stake(env: Env, ip_id: u64) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::Unauthorized));
+        admin.require_auth();
 
-/// Validates that the IP has been revoked (required before cleanup).
-///
-/// # Panics
-///
-/// Panics with `IpAlreadyRevoked` (reused semantics) if the IP is not revoked.
-    // ── Issue: Periodic Snapshots for Disaster Recovery ────────────────────────────────────────
+        let mut stake: StakeRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IpStake(ip_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::StakeNotFound));
 
-    /// Create a snapshot of the current commitment registry state.
-    ///
-    /// Records the total number of committed IPs and a checksum of the next
-    /// available ID as a lightweight state fingerprint. Admin-only.
-    /// Returns the new snapshot_id.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the caller is not the admin.
-    pub fn create_snapshot(env: Env, caller: Address) -> u64 {
-        caller.require_auth();
-        let admin: Option<Address> = env.storage().persistent().get(&DataKey::Admin);
-        if admin.map_or(true, |a| a != caller) {
-            env.panic_with_error(soroban_sdk::Error::from_contract_error(
-                ContractError::Unauthorized as u32,
-            ));
+        if stake.slashed {
+            panic_with_error!(&env, ContractError::StakeAlreadySlashed);
         }
 
-        let next_id: u64 = env
+        stake.slashed = true;
+        env.storage().persistent().set(&DataKey::IpStake(ip_id), &stake);
+        env.storage().persistent().extend_ttl(&DataKey::IpStake(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        // Penalise reputation
+        let mut rep: ReputationRecord = env
             .storage()
             .persistent()
-            .get(&DataKey::NextId)
-            .unwrap_or(1);
+            .get(&DataKey::OwnerReputation(stake.owner.clone()))
+            .unwrap_or(ReputationRecord {
+                owner: stake.owner.clone(),
+                score: 0,
+                commitments: 0,
+                disputes_lost: 0,
+            });
+        rep.score = rep.score.saturating_sub(10);
+        rep.disputes_lost += 1;
+        env.storage().persistent().set(&DataKey::OwnerReputation(stake.owner.clone()), &rep);
+        env.storage().persistent().extend_ttl(&DataKey::OwnerReputation(stake.owner.clone()), LEDGER_BUMP, LEDGER_BUMP);
 
-        let checksum: BytesN<32> = env
-            .crypto()
-            .sha256(&Bytes::from_array(&env, &next_id.to_be_bytes()))
-            .into();
+        env.events().publish((symbol_short!("slashed"), stake.owner), ip_id);
+    }
 
-        let snapshot_id: u64 = env
+    /// Unstake: remove an active (non-slashed) stake. Owner-only.
+    pub fn unstake(env: Env, ip_id: u64) {
+        let stake: StakeRecord = env
             .storage()
             .persistent()
-            .get(&DataKey::NextSnapshotId)
+            .get(&DataKey::IpStake(ip_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::StakeNotFound));
+
+        stake.owner.require_auth();
+
+        if stake.slashed {
+            panic_with_error!(&env, ContractError::StakeAlreadySlashed);
+        }
+
+        env.storage().persistent().remove(&DataKey::IpStake(ip_id));
+        env.events().publish((symbol_short!("unstaked"), stake.owner), ip_id);
+    }
+
+    /// Get the stake record for an IP.
+    pub fn get_stake(env: Env, ip_id: u64) -> Option<StakeRecord> {
+        env.storage().persistent().get(&DataKey::IpStake(ip_id))
+    }
+
+    // ── Issue #448: IP Commitment Reputation System ───────────────────────────
+
+    /// Get the reputation record for an owner. Returns a default record if none exists.
+    pub fn get_reputation(env: Env, owner: Address) -> ReputationRecord {
+        env.storage()
+            .persistent()
+            .get(&DataKey::OwnerReputation(owner.clone()))
+            .unwrap_or(ReputationRecord {
+                owner,
+                score: 0,
+                commitments: 0,
+                disputes_lost: 0,
+            })
+    }
+
+    /// Increment the commitment count and score for an owner (called internally on commit).
+    /// Also callable by admin to manually adjust reputation.
+    pub fn update_reputation(env: Env, owner: Address, score_delta: i64) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::Unauthorized));
+        admin.require_auth();
+
+        let mut rep: ReputationRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OwnerReputation(owner.clone()))
+            .unwrap_or(ReputationRecord {
+                owner: owner.clone(),
+                score: 0,
+                commitments: 0,
+                disputes_lost: 0,
+            });
+        rep.score = rep.score.saturating_add(score_delta);
+        env.storage().persistent().set(&DataKey::OwnerReputation(owner.clone()), &rep);
+        env.storage().persistent().extend_ttl(&DataKey::OwnerReputation(owner), LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    // ── Issue #449: IP Commitment Dispute Arbitration ─────────────────────────
+
+    /// Nominate an address as an arbitrator (admin-only).
+    pub fn nominate_arbitrator(env: Env, arbitrator: Address) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::Unauthorized));
+        admin.require_auth();
+
+        let mut pool: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ArbitratorPool)
+            .unwrap_or(Vec::new(&env));
+
+        // Idempotent: skip if already in pool
+        for a in pool.iter() {
+            if a == arbitrator {
+                return;
+            }
+        }
+        pool.push_back(arbitrator.clone());
+        env.storage().persistent().set(&DataKey::ArbitratorPool, &pool);
+        env.storage().persistent().extend_ttl(&DataKey::ArbitratorPool, LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish((symbol_short!("arb_nom"), admin), arbitrator);
+    }
+
+    /// Open an arbitration case for an existing dispute. Admin-only.
+    /// Returns the new arbitration_id.
+    pub fn open_arbitration(env: Env, dispute_id: u64) -> u64 {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::Unauthorized));
+        admin.require_auth();
+
+        // Ensure dispute exists
+        let _dispute: DisputeRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IpDisputes(dispute_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::DisputeNotFound));
+
+        let arb_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextArbitrationId)
             .unwrap_or(1);
 
-        let snapshot = CommitmentSnapshot {
-            snapshot_id,
-            timestamp: env.ledger().timestamp(),
-            total_count: next_id.saturating_sub(1),
-            checksum,
+        let pool: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ArbitratorPool)
+            .unwrap_or(Vec::new(&env));
+
+        let case = ArbitrationRecord {
+            arbitration_id: arb_id,
+            dispute_id,
+            arbitrators: pool,
+            votes_owner: 0,
+            votes_challenger: 0,
+            finalized: false,
+            winner: None,
         };
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Snapshot(snapshot_id), &snapshot);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::Snapshot(snapshot_id), LEDGER_BUMP, LEDGER_BUMP);
+        env.storage().persistent().set(&DataKey::ArbitrationCase(arb_id), &case);
+        env.storage().persistent().extend_ttl(&DataKey::ArbitrationCase(arb_id), LEDGER_BUMP, LEDGER_BUMP);
+        env.storage().persistent().set(&DataKey::NextArbitrationId, &(arb_id + 1));
+        env.storage().persistent().extend_ttl(&DataKey::NextArbitrationId, LEDGER_BUMP, LEDGER_BUMP);
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::NextSnapshotId, &(snapshot_id + 1));
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::NextSnapshotId, LEDGER_BUMP, LEDGER_BUMP);
-
-        env.events().publish(
-            (symbol_short!("snapshot"), caller),
-            (snapshot_id, env.ledger().timestamp()),
-        );
-
-        snapshot_id
+        arb_id
     }
 
-    /// Retrieve a previously created snapshot by ID.
-    ///
-    /// Returns `None` if no snapshot with that ID exists.
-    pub fn get_snapshot(env: Env, snapshot_id: u64) -> Option<CommitmentSnapshot> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Snapshot(snapshot_id))
-    }
+    /// Cast a vote on an arbitration case. `vote_for_owner = true` votes for the
+    /// IP owner; `false` votes for the challenger. Caller must be a nominated arbitrator.
+    pub fn vote_on_dispute(env: Env, arbitration_id: u64, voter: Address, vote_for_owner: bool) {
+        voter.require_auth();
 
-    // ── Issue: Cryptographic Checksum Integrity Verification ────────────────────────────────────────
-
-    /// Compute and store a sha256 checksum over all active (non-revoked)
-    /// commitment hashes in ID order. Admin-only.
-    ///
-    /// Returns the computed checksum. Stored under `CommitmentChecksumV2`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the caller is not the admin.
-    pub fn compute_integrity_checksum(env: Env, caller: Address) -> BytesN<32> {
-        caller.require_auth();
-        let admin: Option<Address> = env.storage().persistent().get(&DataKey::Admin);
-        if admin.map_or(true, |a| a != caller) {
-            env.panic_with_error(soroban_sdk::Error::from_contract_error(
-                ContractError::Unauthorized as u32,
-            ));
-        }
-
-        let next_id: u64 = env
+        let mut case: ArbitrationRecord = env
             .storage()
             .persistent()
-            .get(&DataKey::NextId)
-            .unwrap_or(1);
+            .get(&DataKey::ArbitrationCase(arbitration_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::ArbitrationNotFound));
 
-        let mut preimage = Bytes::new(&env);
-        for id in 1..next_id {
-            if let Some(record) = env
-                .storage()
-                .persistent()
-                .get::<DataKey, IpRecord>(&DataKey::IpRecord(id))
-            {
-                if !record.revoked {
-                    preimage.append(&record.commitment_hash.into());
-                }
+        if case.finalized {
+            panic_with_error!(&env, ContractError::ArbitrationAlreadyFinalized);
+        }
+
+        // Verify voter is in the arbitrator pool
+        let mut is_arbitrator = false;
+        for a in case.arbitrators.iter() {
+            if a == voter {
+                is_arbitrator = true;
+                break;
             }
         }
+        if !is_arbitrator {
+            panic_with_error!(&env, ContractError::NotAnArbitrator);
+        }
 
-        let checksum: BytesN<32> = env.crypto().sha256(&preimage).into();
+        if vote_for_owner {
+            case.votes_owner += 1;
+        } else {
+            case.votes_challenger += 1;
+        }
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::CommitmentChecksumV2, &checksum);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::CommitmentChecksumV2, LEDGER_BUMP, LEDGER_BUMP);
+        env.storage().persistent().set(&DataKey::ArbitrationCase(arbitration_id), &case);
+        env.storage().persistent().extend_ttl(&DataKey::ArbitrationCase(arbitration_id), LEDGER_BUMP, LEDGER_BUMP);
 
-        checksum
+        env.events().publish((symbol_short!("arb_vote"), voter), (arbitration_id, vote_for_owner));
     }
 
-    /// Verify that the stored integrity checksum matches a freshly computed one.
-    ///
-    /// Returns `true` if they match or no checksum has been stored yet.
-    /// Returns `false` if the stored checksum differs from the recomputed one.
-    pub fn verify_integrity_checksum(env: Env) -> bool {
-        let stored: Option<BytesN<32>> = env
+    /// Finalize an arbitration case. Admin-only. Determines winner by majority vote
+    /// and resolves the underlying dispute.
+    pub fn finalize_arbitration(env: Env, arbitration_id: u64) {
+        let admin: Address = env
             .storage()
             .persistent()
-            .get(&DataKey::CommitmentChecksumV2);
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::Unauthorized));
+        admin.require_auth();
 
-        let stored = match stored {
-            Some(s) => s,
-            None => return true,
+        let mut case: ArbitrationRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ArbitrationCase(arbitration_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::ArbitrationNotFound));
+
+        if case.finalized {
+            panic_with_error!(&env, ContractError::ArbitrationAlreadyFinalized);
+        }
+
+        let mut dispute: DisputeRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IpDisputes(case.dispute_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::DisputeNotFound));
+
+        let ip_record = require_ip_exists(&env, dispute.ip_id);
+
+        // Majority vote determines winner; ties go to the IP owner
+        let winner = if case.votes_challenger > case.votes_owner {
+            dispute.challenger.clone()
+        } else {
+            ip_record.owner.clone()
         };
 
-        let next_id: u64 = env
-            .storage()
+        case.finalized = true;
+        case.winner = Some(winner.clone());
+        dispute.resolved = true;
+        dispute.winner = Some(winner.clone());
+
+        env.storage().persistent().set(&DataKey::ArbitrationCase(arbitration_id), &case);
+        env.storage().persistent().extend_ttl(&DataKey::ArbitrationCase(arbitration_id), LEDGER_BUMP, LEDGER_BUMP);
+        env.storage().persistent().set(&DataKey::IpDisputes(case.dispute_id), &dispute);
+        env.storage().persistent().extend_ttl(&DataKey::IpDisputes(case.dispute_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish((symbol_short!("arb_fin"), winner.clone()), arbitration_id);
+    }
+
+    /// Get an arbitration case by ID.
+    pub fn get_arbitration(env: Env, arbitration_id: u64) -> ArbitrationRecord {
+        env.storage()
             .persistent()
-            .get(&DataKey::NextId)
-            .unwrap_or(1);
-
-        let mut preimage = Bytes::new(&env);
-        for id in 1..next_id {
-            if let Some(record) = env
-                .storage()
-                .persistent()
-                .get::<DataKey, IpRecord>(&DataKey::IpRecord(id))
-            {
-                if !record.revoked {
-                    preimage.append(&record.commitment_hash.into());
-                }
-            }
-        }
-
-        let recomputed: BytesN<32> = env.crypto().sha256(&preimage).into();
-        stored == recomputed
-    }
-
-    // ── Issue: Batch Expire Commitments ─────────────────────────────────────────────────────────────────────────────────
-
-    /// Revoke multiple IP commitments in a single transaction.
-    ///
-    /// The caller must be the owner of every IP in the list. All IPs are
-    /// revoked atomically — if any check fails the entire transaction panics.
-    /// Returns the number of IPs revoked.
-    ///
-    /// # Panics
-    ///
-    /// Panics if any IP does not exist, the caller is not its owner, or it is
-    /// already revoked.
-    pub fn batch_revoke_commitments(env: Env, owner: Address, ip_ids: Vec<u64>) -> u32 {
-        owner.require_auth();
-
-        let mut count: u32 = 0;
-        for ip_id in ip_ids.iter() {
-            let mut record = require_ip_exists(&env, ip_id);
-            if record.owner != owner {
-                env.panic_with_error(soroban_sdk::Error::from_contract_error(
-                    ContractError::Unauthorized as u32,
-                ));
-            }
-            require_not_revoked(&env, &record);
-
-            record.revoked = true;
-            env.storage()
-                .persistent()
-                .set(&DataKey::IpRecord(ip_id), &record);
-            env.storage()
-                .persistent()
-                .extend_ttl(&DataKey::IpRecord(ip_id), 50000, 50000);
-
-            env.events().publish(
-                (symbol_short!("revoked"), owner.clone()),
-                (ip_id, env.ledger().timestamp()),
-            );
-
-            Self::append_audit_entry(&env, ip_id, symbol_short!("revoked"), owner.clone());
-            count += 1;
-        }
-
-        count
-    }
-
-fn require_is_revoked(env: &Env, record: &IpRecord) {
-    if !record.revoked {
-        env.panic_with_error(soroban_sdk::Error::from_contract_error(
-            ContractError::IpNotFound as u32,
-        ));
+            .get(&DataKey::ArbitrationCase(arbitration_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::ArbitrationNotFound))
     }
 }
 

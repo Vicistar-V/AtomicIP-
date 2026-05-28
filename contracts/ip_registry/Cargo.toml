@@ -14,3 +14,4 @@ testutils = ["soroban-sdk/testutils"]
 
 [dev-dependencies]
 soroban-sdk = { version = "22.0.0", features = ["testutils"] }
+ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
