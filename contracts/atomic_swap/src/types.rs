@@ -63,6 +63,8 @@ pub enum DataKey {
     AtomicRefundProcessed(u64),
     /// #358: Maps swap_id → new expiry timestamp for timeout escalation.
     TimeoutExtension(u64),
+    /// #523: Maps batch fingerprint → Vec<u64> of swap IDs for idempotent batch results.
+    BatchSwapResult(BytesN<32>),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
