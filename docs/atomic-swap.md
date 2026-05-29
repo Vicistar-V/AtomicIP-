@@ -379,3 +379,71 @@ swap_contract.batch_reveal_keys(
 | `BatchKeysRevealedEvent` | `btch_key` | `batch_reveal_keys` |
 
 Individual `SwapInitiatedEvent` events are still emitted per swap inside `batch_initiate_swap`.
+
+---
+
+## Off-Chain Batch Utilities
+
+The following JavaScript utilities live in `src/batch/` and operate entirely off-chain. They are used to prepare or process batch swap data before submitting to the contract or after reading from it.
+
+---
+
+### #525: Batch Swap Compression
+
+**Module:** `src/batch/batchCompressor.js`
+
+Compresses an array of swap record objects into a compact `Buffer` using deflate (Node built-in `zlib`), and decompresses it back. Useful for reducing payload size when transmitting or storing batches off-chain.
+
+```js
+const { compressBatchSwaps, decompressBatchSwaps } = require("./src/batch/batchCompressor");
+
+const swaps = [
+  { swapId: "s1", state: "PENDING", amount: 1000 },
+  { swapId: "s2", state: "PENDING", amount: 2000 },
+];
+
+const compressed = compressBatchSwaps(swaps);       // Buffer
+const restored   = decompressBatchSwaps(compressed); // original array
+```
+
+**Constraints:**
+- `swaps` must be a non-empty array of objects, max 100 entries
+- `compressed` must be a `Buffer` produced by `compressBatchSwaps`
+- Throws `TypeError` for invalid input types, `RangeError` if batch exceeds the limit
+
+---
+
+### #526: Batch Swap Encryption
+
+**Module:** `src/batch/batchEncryptor.js`
+
+Encrypts a `Buffer` of swap data with AES-256-GCM (Node built-in `crypto`) and decrypts it back. The GCM auth tag ensures tampered ciphertext is rejected automatically.
+
+Wire format: `[ 12-byte IV | 16-byte auth-tag | ciphertext ]`
+
+```js
+const crypto = require("crypto");
+const { encryptBatchSwaps, decryptBatchSwaps } = require("./src/batch/batchEncryptor");
+
+const key  = crypto.randomBytes(32); // 256-bit key — store securely
+const data = Buffer.from(JSON.stringify(swaps));
+
+const encrypted = encryptBatchSwaps(data, key);   // Buffer
+const plaintext = decryptBatchSwaps(encrypted, key); // original Buffer
+```
+
+**Constraints:**
+- `key` must be a 32-byte `Buffer` (AES-256)
+- `data` / `encrypted` must be `Buffer` or `Uint8Array`
+- Throws `Error("Decryption failed: invalid key or tampered data.")` on auth failure
+- Each call to `encryptBatchSwaps` uses a fresh random IV, so identical inputs produce different ciphertexts
+
+**Compose with compression:**
+
+```js
+const compressed = compressBatchSwaps(swaps);
+const encrypted  = encryptBatchSwaps(compressed, key);
+// transmit / store `encrypted` ...
+const decrypted  = decryptBatchSwaps(encrypted, key);
+const restored   = decompressBatchSwaps(decrypted);
+```
