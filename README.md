@@ -104,12 +104,23 @@ Latest testnet deployment addresses are published in GitHub Actions deployment s
 
 ## 📖 Documentation
 
+### Core Documentation
 - [Architecture Overview](docs/architecture.md)
 - [Commitment Scheme](docs/commitment-scheme.md)
-- [Changelog Format](docs/changelog-format.md)
 - [Atomic Swap Flow](docs/atomic-swap.md)
 - [Threat Model & Security](docs/threat-model.md)
 - [Integration Guide for Wallet Providers](docs/integration-guide.md)
+
+### API Enhancements (v1.1)
+- [API Enhancements Summary](docs/api-enhancements-summary.md) — Overview of all new features
+- [GraphQL Subscriptions](docs/graphql-subscriptions.md) — Real-time event streaming (#529)
+- [API Caching Layer](docs/api-caching.md) — Performance optimization (#530)
+- [API Request Deduplication](docs/api-request-deduplication.md) — Idempotency support (#531)
+- [API Batch Requests](docs/api-batch-requests.md) — Reduce round trips (#532)
+
+### Additional Resources
+- [API Reference](docs/api-reference.md)
+- [Changelog Format](docs/changelog-format.md)
 - [Security Policy](SECURITY.md)
 - [Roadmap](docs/roadmap.md)
 
