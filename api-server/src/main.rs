@@ -129,7 +129,11 @@ async fn require_json_content_type(req: Request<Body>, next: Next) -> Result<Res
 async fn main() {
     metrics::init();
 
-    let schema = graphql::build_schema();
+    let subscription_broadcaster = Arc::new(graphql::SubscriptionBroadcaster::new());
+    let schema = graphql::build_schema_with_broadcaster(
+        Arc::new(graphql::MockSorobanRpcClient::default()),
+        subscription_broadcaster.clone(),
+    );
     let broadcaster = Arc::new(websocket::EventBroadcaster::new());
     let health_checker = Arc::new(health::HealthChecker::new());
 
@@ -164,6 +168,7 @@ async fn main() {
     println!("WebSocket    -> ws://localhost:8080/ws");
     println!("Events SSE   -> http://localhost:8080/events");
     println!("Batch API    -> http://localhost:8080/batch");
+    println!("GraphQL      -> http://localhost:8080/graphql");
     axum::serve(listener, app).await.unwrap();
 }
 
