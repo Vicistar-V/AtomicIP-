@@ -771,6 +771,58 @@ let results = client.batch_verify_commitments(&requests);
 
 ---
 
+## Issue #462 — Batch Staking for IP Commitments
+
+### `batch_stake_commitments`
+
+Stake XLM against multiple IP commitments in a single contract call. Each `ip_ids[i]` is paired with `amounts[i]` and requires the corresponding IP owner to authorize the transaction.
+
+```rust
+pub fn batch_stake_commitments(env: Env, ip_ids: Vec<u64>, amounts: Vec<i128>)
+```
+
+#### Panics
+
+- `BatchSizeMismatch` if `ip_ids.len() != amounts.len()`
+- `AlreadyStaked` if any IP already has an active stake
+- `StakeNotFound` is not returned by this call; it only operates on existing IPs
+
+#### Example
+
+```rust
+let ip_ids = vec![1u64, 2u64];
+let amounts = vec![100i128, 200i128];
+client.batch_stake_commitments(&ip_ids, &amounts);
+```
+
+---
+
+## Issue #463 — Batch Reputation Update for Multiple Commitments
+
+### `batch_update_reputation`
+
+Update reputation scores for multiple IP commitments in one call. Each `ip_ids[i]` is used to resolve the owner, and `score_deltas[i]` is applied to that owner's reputation record.
+
+```rust
+pub fn batch_update_reputation(env: Env, ip_ids: Vec<u64>, score_deltas: Vec<i64>)
+```
+
+#### Panics
+
+- `BatchSizeMismatch` if `ip_ids.len() != score_deltas.len()`
+- `Unauthorized` if the caller is not the configured admin
+- `IpNotFound` if any IP ID does not exist
+
+#### Example
+
+```rust
+let ip_ids = vec![1u64, 2u64];
+let score_deltas = vec![10i64, -5i64];
+client.batch_update_reputation(&ip_ids, &score_deltas);
+```
+
+---
+
 ## Issue #459 — Hierarchical Storage for Commitments
 
 Organises IP commitments in a two-level hierarchy: `owner → category → ip_ids`. This enables O(1) category-scoped lookups without scanning the full owner index.

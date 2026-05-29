@@ -3069,6 +3069,38 @@ impl IpRegistry {
         env.events().publish((symbol_short!("staked"), record.owner), (ip_id, amount));
     }
 
+    /// Stake XLM against multiple IP commitments in one call.
+    /// Each `ip_ids[i]` is staked with `amounts[i]` and requires the owner
+    /// of that IP to authorize the call.
+    pub fn batch_stake_commitments(env: Env, ip_ids: Vec<u64>, amounts: Vec<i128>) {
+        if ip_ids.len() != amounts.len() {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::BatchSizeMismatch as u32,
+            ));
+        }
+
+        for i in 0..ip_ids.len() {
+            let ip_id = ip_ids.get(i).unwrap();
+            let amount = amounts.get(i).unwrap();
+            let record = require_ip_exists(&env, *ip_id);
+            record.owner.require_auth();
+
+            if env.storage().persistent().has(&DataKey::IpStake(*ip_id)) {
+                panic_with_error!(&env, ContractError::AlreadyStaked);
+            }
+
+            let stake = StakeRecord {
+                ip_id: *ip_id,
+                owner: record.owner.clone(),
+                amount: *amount,
+                slashed: false,
+            };
+            env.storage().persistent().set(&DataKey::IpStake(*ip_id), &stake);
+            env.storage().persistent().extend_ttl(&DataKey::IpStake(*ip_id), LEDGER_BUMP, LEDGER_BUMP);
+            env.events().publish((symbol_short!("staked"), record.owner), (*ip_id, *amount));
+        }
+    }
+
     /// Slash the stake for an IP (admin-only). Marks the stake as slashed and
     /// decrements the owner's reputation score.
     pub fn slash_stake(env: Env, ip_id: u64) {
@@ -3173,6 +3205,45 @@ impl IpRegistry {
         rep.score = rep.score.saturating_add(score_delta);
         env.storage().persistent().set(&DataKey::OwnerReputation(owner.clone()), &rep);
         env.storage().persistent().extend_ttl(&DataKey::OwnerReputation(owner), LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    /// Adjust reputation for multiple IP commitments in one call.
+    /// Each `ip_ids[i]` is used to lookup the IP owner, then the corresponding
+    /// `score_deltas[i]` is applied to that owner's reputation.
+    pub fn batch_update_reputation(env: Env, ip_ids: Vec<u64>, score_deltas: Vec<i64>) {
+        if ip_ids.len() != score_deltas.len() {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::BatchSizeMismatch as u32,
+            ));
+        }
+
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::Unauthorized));
+        admin.require_auth();
+
+        for i in 0..ip_ids.len() {
+            let ip_id = ip_ids.get(i).unwrap();
+            let score_delta = score_deltas.get(i).unwrap();
+            let record = require_ip_exists(&env, *ip_id);
+            let owner = record.owner.clone();
+
+            let mut rep: ReputationRecord = env
+                .storage()
+                .persistent()
+                .get(&DataKey::OwnerReputation(owner.clone()))
+                .unwrap_or(ReputationRecord {
+                    owner: owner.clone(),
+                    score: 0,
+                    commitments: 0,
+                    disputes_lost: 0,
+                });
+            rep.score = rep.score.saturating_add(*score_delta);
+            env.storage().persistent().set(&DataKey::OwnerReputation(owner.clone()), &rep);
+            env.storage().persistent().extend_ttl(&DataKey::OwnerReputation(owner), LEDGER_BUMP, LEDGER_BUMP);
+        }
     }
 
     // ── Issue #449: IP Commitment Dispute Arbitration ─────────────────────────
