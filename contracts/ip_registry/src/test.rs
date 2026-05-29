@@ -22,6 +22,7 @@ mod tests {
             blinding_factor: BytesN<32>,
         ) -> bool;
         fn list_ip_by_owner(env: Env, owner: Address) -> Vec<u64>;
+        fn get_stake(env: Env, ip_id: u64) -> Option<StakeRecord>;
         fn transfer_ip(env: Env, ip_id: u64, new_owner: Address);
         fn transfer_ip_ownership(env: Env, ip_id: u64, new_owner: Address);
         fn revoke_ip(env: Env, ip_id: u64);
@@ -62,6 +63,9 @@ mod tests {
         // Issue #432
         fn batch_verify_commitments(env: Env, verifications: Vec<(u64, BytesN<32>, BytesN<32>)>) -> Vec<bool>;
         fn batch_commit_ip_anonymous(env: Env, blinded_owner: BytesN<32>, commitment_hashes: Vec<BytesN<32>>) -> Vec<u64>;
+        fn batch_stake_commitments(env: Env, ip_ids: Vec<u64>, amounts: Vec<i128>);
+        fn batch_update_reputation(env: Env, ip_ids: Vec<u64>, score_deltas: Vec<i64>);
+        fn get_reputation(env: Env, owner: Address) -> crate::ReputationRecord;
         fn get_anonymous_owner(env: Env, commitment_hash: BytesN<32>) -> Option<BytesN<32>>;
         // Issue #433
         fn issue_ownership_challenge(env: Env, ip_id: u64, challenger: Address, nonce: BytesN<32>) -> u64;
@@ -169,6 +173,123 @@ mod tests {
         assert_eq!(record.commitment_hash, commitment);
         assert_eq!(record.ip_id, ip_id);
         assert_eq!(observed_data.1, record.timestamp);
+    }
+
+    #[test]
+    fn test_batch_stake_commitments_success() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner1 = <Address as TestAddress>::generate(&env);
+        let owner2 = <Address as TestAddress>::generate(&env);
+        let commitment1 = BytesN::from_array(&env, &[11u8; 32]);
+        let commitment2 = BytesN::from_array(&env, &[12u8; 32]);
+
+        env.mock_all_auths();
+        let ip_id1 = client.commit_ip(&owner1, &commitment1, &0u32);
+        let ip_id2 = client.commit_ip(&owner2, &commitment2, &0u32);
+
+        let mut ip_ids = Vec::new(&env);
+        ip_ids.push_back(ip_id1);
+        ip_ids.push_back(ip_id2);
+
+        let mut amounts = Vec::new(&env);
+        amounts.push_back(100i128);
+        amounts.push_back(200i128);
+
+        client.batch_stake_commitments(&ip_ids, &amounts);
+
+        let stake1 = client.get_stake(&ip_id1).unwrap();
+        let stake2 = client.get_stake(&ip_id2).unwrap();
+
+        assert_eq!(stake1.ip_id, ip_id1);
+        assert_eq!(stake1.owner, owner1);
+        assert_eq!(stake1.amount, 100i128);
+        assert!(!stake1.slashed);
+
+        assert_eq!(stake2.ip_id, ip_id2);
+        assert_eq!(stake2.owner, owner2);
+        assert_eq!(stake2.amount, 200i128);
+        assert!(!stake2.slashed);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_batch_stake_commitments_mismatched_lengths_panics() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let commitment = BytesN::from_array(&env, &[13u8; 32]);
+
+        env.mock_all_auths();
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
+
+        let mut ip_ids = Vec::new(&env);
+        ip_ids.push_back(ip_id);
+
+        let mut amounts = Vec::new(&env);
+        amounts.push_back(100i128);
+        amounts.push_back(200i128);
+
+        client.batch_stake_commitments(&ip_ids, &amounts);
+    }
+
+    #[test]
+    fn test_batch_update_reputation_for_multiple_commitments() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner1 = <Address as TestAddress>::generate(&env);
+        let owner2 = <Address as TestAddress>::generate(&env);
+        let commitment1 = BytesN::from_array(&env, &[14u8; 32]);
+        let commitment2 = BytesN::from_array(&env, &[15u8; 32]);
+
+        env.mock_all_auths();
+        let ip_id1 = client.commit_ip(&owner1, &commitment1, &0u32);
+        let ip_id2 = client.commit_ip(&owner2, &commitment2, &0u32);
+
+        let mut ip_ids = Vec::new(&env);
+        ip_ids.push_back(ip_id1);
+        ip_ids.push_back(ip_id2);
+
+        let mut deltas = Vec::new(&env);
+        deltas.push_back(10i64);
+        deltas.push_back(-5i64);
+
+        client.batch_update_reputation(&ip_ids, &deltas);
+
+        let rep1 = client.get_reputation(&owner1);
+        let rep2 = client.get_reputation(&owner2);
+
+        assert_eq!(rep1.score, 10);
+        assert_eq!(rep2.score, -5);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_batch_update_reputation_mismatched_lengths_panics() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let commitment = BytesN::from_array(&env, &[16u8; 32]);
+
+        env.mock_all_auths();
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
+
+        let mut ip_ids = Vec::new(&env);
+        ip_ids.push_back(ip_id);
+
+        let mut deltas = Vec::new(&env);
+        deltas.push_back(10i64);
+        deltas.push_back(20i64);
+
+        client.batch_update_reputation(&ip_ids, &deltas);
     }
 
     #[test]
