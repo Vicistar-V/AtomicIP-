@@ -55,10 +55,17 @@ echo "Compressing backup..."
 tar -czf "$BACKUP_DIR/backup_$TIMESTAMP.tar.gz" -C "$BACKUP_DIR" "$TIMESTAMP"
 rm -rf "$BACKUP_DIR/$TIMESTAMP"
 
-# Upload to remote storage if configured
+# Write a SHA-256 checksum sidecar so integrity can be verified later (#559).
+echo "Writing checksum sidecar..."
+( cd "$BACKUP_DIR" && sha256sum "backup_$TIMESTAMP.tar.gz" > "backup_$TIMESTAMP.tar.gz.sha256" )
+
+# Upload to remote storage if configured (archive + checksum sidecar)
 if [ -n "$BACKUP_S3_BUCKET" ]; then
     echo "Uploading to S3..."
     aws s3 cp "$BACKUP_DIR/backup_$TIMESTAMP.tar.gz" \
+      "s3://$BACKUP_S3_BUCKET/$NETWORK/" \
+      --storage-class STANDARD_IA
+    aws s3 cp "$BACKUP_DIR/backup_$TIMESTAMP.tar.gz.sha256" \
       "s3://$BACKUP_S3_BUCKET/$NETWORK/" \
       --storage-class STANDARD_IA
 fi

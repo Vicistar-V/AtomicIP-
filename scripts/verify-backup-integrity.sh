@@ -20,6 +20,28 @@ echo "Verifying backup: $BACKUP_FILE"
 echo "File size: $(du -h "$BACKUP_FILE" | cut -f1)"
 echo ""
 
+# Verify SHA-256 checksum against a sidecar file if one is present (#559).
+# backup-contract-state.sh writes "<backup>.sha256" alongside each archive.
+# A mismatch means the archive was altered or truncated in transit/at rest.
+CHECKSUM_FILE="$BACKUP_FILE.sha256"
+if [ -f "$CHECKSUM_FILE" ]; then
+    echo "Verifying SHA-256 checksum..."
+    EXPECTED=$(awk '{print $1}' "$CHECKSUM_FILE")
+    ACTUAL=$(sha256sum "$BACKUP_FILE" | awk '{print $1}')
+    if [ "$EXPECTED" = "$ACTUAL" ]; then
+        echo "✓ Checksum matches ($ACTUAL)"
+    else
+        echo "✗ Checksum mismatch"
+        echo "  expected: $EXPECTED"
+        echo "  actual:   $ACTUAL"
+        exit 1
+    fi
+    echo ""
+else
+    echo "Note: no checksum sidecar ($CHECKSUM_FILE); skipping checksum verification"
+    echo ""
+fi
+
 # Test archive integrity
 echo "Testing archive integrity..."
 if tar -tzf "$BACKUP_FILE" > /dev/null 2>&1; then

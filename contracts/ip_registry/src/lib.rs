@@ -28,6 +28,9 @@ mod differential_tests;
 #[cfg(test)]
 mod invariant_tests;
 
+#[cfg(test)]
+mod upgrade_tests;
+
 // ── Error Codes ────────────────────────────────────────────────────────────
 
 #[contracterror]

@@ -118,6 +118,14 @@ Latest testnet deployment addresses are published in GitHub Actions deployment s
 - [API Request Deduplication](docs/api-request-deduplication.md) — Idempotency support (#531)
 - [API Batch Requests](docs/api-batch-requests.md) — Reduce round trips (#532)
 
+### Operations & Reliability
+- [Contract Upgrade Testing](docs/contract-upgrade-testing.md) — Upgrade compatibility & authorization tests (#557)
+- [Disaster Recovery Testing](docs/disaster-recovery-testing.md) — Automated backup→restore drill (#558)
+- [Backup Integrity Verification](docs/backup-integrity-verification.md) — Checksum & structural verification (#559)
+- [Canary Deployment Testing](docs/canary-deployment.md) — Health-gated rollout with auto-rollback (#560)
+- [Disaster Recovery Plan](docs/disaster-recovery-plan.md)
+- [Backup & Recovery Guide](docs/backup-recovery-guide.md)
+
 ### Additional Resources
 - [API Reference](docs/api-reference.md)
 - [Changelog Format](docs/changelog-format.md)
