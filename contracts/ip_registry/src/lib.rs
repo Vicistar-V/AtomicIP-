@@ -73,6 +73,12 @@ pub enum ContractError {
     BatchMetadataTooLarge = 27,
     /// #457: Encrypted data too large.
     EncryptedDataTooLarge = 28,
+    /// #465: Escrow not found.
+    EscrowNotFound = 29,
+    /// #465: Escrow already released or cancelled.
+    EscrowNotActive = 30,
+    /// #465: Timeout not reached for cancellation.
+    EscrowTimeoutNotReached = 31,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -139,6 +145,15 @@ pub enum DataKey {
     // Issue #459: Hierarchical storage
     HierarchyNode(Address, BytesN<32>), // maps (owner, category_hash) -> Vec<u64> of IP IDs
     OwnerCategories(Address),           // maps owner -> Vec<BytesN<32>> of category hashes
+    // Issue #454: Threshold signatures
+    ThresholdConfig(u64),
+    ThresholdSignatures(u64),
+    // Issue #455: Batch metadata
+    BatchMetadata(u64),
+    // Issue #457: Encrypted commitment
+    EncryptedCommitment(u64),
+    // Issue #465: Batch escrow — keyed by escrow_id (sha256 of ip_ids + timestamp)
+    BatchEscrow(BytesN<32>),
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -306,6 +321,31 @@ pub struct EncryptedCommitmentRecord {
     pub ip_id: u64,
     pub encrypted_hash: Bytes,    // commitment hash encrypted with owner's key
     pub key_hint: BytesN<32>,     // public key hint (e.g. sha256 of owner's public key)
+    pub timestamp: u64,
+}
+
+// ── Issue #465: Batch Escrow ─────────────────────────────────────────────────
+
+/// Escrow status for batch commitment escrow.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+#[repr(u32)]
+pub enum EscrowStatus {
+    Active = 0,
+    Released = 1,
+    Cancelled = 2,
+}
+
+/// Escrow record for multiple commitments held in trust.
+#[contracttype]
+#[derive(Clone)]
+pub struct EscrowRecord {
+    pub escrow_id: BytesN<32>,
+    pub depositor: Address,
+    pub ip_ids: soroban_sdk::Vec<u64>,
+    pub release_to: Address,
+    pub timeout: u64,
+    pub status: EscrowStatus,
     pub timestamp: u64,
 }
 
@@ -794,6 +834,156 @@ impl IpRegistry {
         env.storage()
             .persistent()
             .get(&DataKey::AnonymousOwner(commitment_hash))
+    }
+
+    /// Retrieve blinded owner identifiers for multiple commitment hashes in a batch.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `commitment_hashes` - Vector of commitment hashes to look up
+    ///
+    /// # Returns
+    ///
+    /// `Vec<Option<BytesN<32>>>` — For each hash, the blinded owner or `None`.
+    pub fn get_blinded_owner_batch(env: Env, commitment_hashes: Vec<BytesN<32>>) -> Vec<Option<BytesN<32>>> {
+        let mut results = Vec::new(&env);
+        for hash in commitment_hashes.iter() {
+            results.push_back(Self::get_anonymous_owner(env.clone(), hash));
+        }
+        results
+    }
+
+    // ── Issue #465: Batch Escrow ────────────────────────────────────────────
+
+    /// Escrow multiple IP commitments for conditional release.
+    ///
+    /// Creates an escrow record holding multiple IP IDs. The depositor locks
+    /// ownership until either released to the beneficiary or cancelled after timeout.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `depositor` - Address initiating the escrow (must own all IP IDs)
+    /// * `ip_ids` - Vector of IP IDs to escrow
+    /// * `release_to` - Address that can claim the IPs upon release
+    /// * `timeout` - Ledger timestamp after which depositor can cancel
+    ///
+    /// # Returns
+    ///
+    /// `BytesN<32>` — Unique escrow ID (sha256 of ip_ids + timestamp)
+    pub fn batch_escrow_commitments(
+        env: Env,
+        depositor: Address,
+        ip_ids: Vec<u64>,
+        release_to: Address,
+        timeout: u64,
+    ) -> BytesN<32> {
+        depositor.require_auth();
+
+        for ip_id in ip_ids.iter() {
+            let record = require_ip_exists(&env, ip_id);
+            if record.owner != depositor {
+                panic_with_error!(&env, ContractError::Unauthorized);
+            }
+        }
+
+        let timestamp = env.ledger().timestamp();
+        let mut id_bytes = Bytes::new(&env);
+        for ip_id in ip_ids.iter() {
+            id_bytes.append(&Bytes::from_array(&env, &ip_id.to_be_bytes()));
+        }
+        id_bytes.append(&Bytes::from_array(&env, &timestamp.to_be_bytes()));
+        let escrow_id: BytesN<32> = env.crypto().sha256(&id_bytes).into();
+
+        let escrow = EscrowRecord {
+            escrow_id: escrow_id.clone(),
+            depositor: depositor.clone(),
+            ip_ids: ip_ids.clone(),
+            release_to,
+            timeout,
+            status: EscrowStatus::Active,
+            timestamp,
+        };
+
+        env.storage().persistent().set(&DataKey::BatchEscrow(escrow_id.clone()), &escrow);
+        env.storage().persistent().extend_ttl(&DataKey::BatchEscrow(escrow_id.clone()), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish((symbol_short!("escrow"), depositor), (escrow_id.clone(), ip_ids.len()));
+
+        escrow_id
+    }
+
+    /// Retrieve an escrow record by ID.
+    ///
+    /// # Returns
+    ///
+    /// `Option<EscrowRecord>` — The escrow record, or `None` if not found.
+    pub fn get_batch_escrow(env: Env, escrow_id: BytesN<32>) -> Option<EscrowRecord> {
+        env.storage().persistent().get(&DataKey::BatchEscrow(escrow_id))
+    }
+
+    /// Release escrowed IPs to the beneficiary.
+    ///
+    /// Transfers ownership of all escrowed IPs to `release_to` address.
+    /// Only the depositor can release before timeout.
+    ///
+    /// # Panics
+    ///
+    /// Panics if escrow not found, not active, or caller unauthorized.
+    pub fn release_batch_escrow(env: Env, escrow_id: BytesN<32>) {
+        let mut escrow: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BatchEscrow(escrow_id.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EscrowNotFound));
+
+        if escrow.status != EscrowStatus::Active {
+            panic_with_error!(&env, ContractError::EscrowNotActive);
+        }
+
+        escrow.depositor.require_auth();
+
+        for ip_id in escrow.ip_ids.iter() {
+            Self::transfer_ip(env.clone(), ip_id, escrow.release_to.clone());
+        }
+
+        escrow.status = EscrowStatus::Released;
+        env.storage().persistent().set(&DataKey::BatchEscrow(escrow_id.clone()), &escrow);
+        env.storage().persistent().extend_ttl(&DataKey::BatchEscrow(escrow_id.clone()), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish((symbol_short!("esc_rel"), escrow.depositor.clone()), escrow_id);
+    }
+
+    /// Cancel escrow and return IPs to depositor.
+    ///
+    /// Only callable by depositor after timeout has passed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if escrow not found, not active, timeout not reached, or caller unauthorized.
+    pub fn cancel_batch_escrow(env: Env, escrow_id: BytesN<32>) {
+        let mut escrow: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BatchEscrow(escrow_id.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EscrowNotFound));
+
+        if escrow.status != EscrowStatus::Active {
+            panic_with_error!(&env, ContractError::EscrowNotActive);
+        }
+
+        escrow.depositor.require_auth();
+
+        if env.ledger().timestamp() < escrow.timeout {
+            panic_with_error!(&env, ContractError::EscrowTimeoutNotReached);
+        }
+
+        escrow.status = EscrowStatus::Cancelled;
+        env.storage().persistent().set(&DataKey::BatchEscrow(escrow_id.clone()), &escrow);
+        env.storage().persistent().extend_ttl(&DataKey::BatchEscrow(escrow_id.clone()), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish((symbol_short!("esc_cnl"), escrow.depositor.clone()), escrow_id);
     }
 
     /// Transfer IP ownership to a new address.

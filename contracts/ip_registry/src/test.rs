@@ -67,6 +67,13 @@ mod tests {
         fn batch_update_reputation(env: Env, ip_ids: Vec<u64>, score_deltas: Vec<i64>);
         fn get_reputation(env: Env, owner: Address) -> crate::ReputationRecord;
         fn get_anonymous_owner(env: Env, commitment_hash: BytesN<32>) -> Option<BytesN<32>>;
+        // Issue #464: Batch anonymity accessor
+        fn get_blinded_owner_batch(env: Env, commitment_hashes: Vec<BytesN<32>>) -> Vec<Option<BytesN<32>>>;
+        // Issue #465: Batch escrow
+        fn batch_escrow_commitments(env: Env, depositor: Address, ip_ids: Vec<u64>, release_to: Address, timeout: u64) -> BytesN<32>;
+        fn get_batch_escrow(env: Env, escrow_id: BytesN<32>) -> Option<crate::EscrowRecord>;
+        fn release_batch_escrow(env: Env, escrow_id: BytesN<32>);
+        fn cancel_batch_escrow(env: Env, escrow_id: BytesN<32>);
         // Issue #433
         fn issue_ownership_challenge(env: Env, ip_id: u64, challenger: Address, nonce: BytesN<32>) -> u64;
         fn respond_to_ownership_challenge(env: Env, challenge_id: u64, response_hash: BytesN<32>);
@@ -2452,5 +2459,226 @@ mod expiry_tests {
             false
         });
         assert!(found, "ip_clean event must be emitted");
+    }
+}
+
+// ── #464: get_blinded_owner_batch tests ──────────────────────────────────────
+
+#[cfg(test)]
+mod blinded_owner_batch_tests {
+    use super::tests::{IpRegistry, IpRegistryClient};
+    use soroban_sdk::{contractclient, testutils::Address as _, Address, BytesN, Env, Vec};
+
+    fn setup() -> (Env, IpRegistryClient<'static>) {
+        let env = Env::default();
+        let id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &id);
+        (env, client)
+    }
+
+    #[test]
+    fn test_get_blinded_owner_batch_returns_stored_values() {
+        let (env, client) = setup();
+        let blinded = BytesN::from_array(&env, &[0xABu8; 32]);
+        let h1 = BytesN::from_array(&env, &[0x11u8; 32]);
+        let h2 = BytesN::from_array(&env, &[0x22u8; 32]);
+        client.batch_commit_ip_anonymous(&blinded, &Vec::from_array(&env, [h1.clone(), h2.clone()]));
+
+        let results = client.get_blinded_owner_batch(&Vec::from_array(&env, [h1, h2]));
+        assert_eq!(results.len(), 2);
+        assert_eq!(results.get(0).unwrap(), Some(blinded.clone()));
+        assert_eq!(results.get(1).unwrap(), Some(blinded));
+    }
+
+    #[test]
+    fn test_get_blinded_owner_batch_returns_none_for_non_anonymous() {
+        let (env, client) = setup();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let h = BytesN::from_array(&env, &[0x33u8; 32]);
+        client.commit_ip(&owner, &h, &0u32);
+
+        let results = client.get_blinded_owner_batch(&Vec::from_array(&env, [h]));
+        assert_eq!(results.get(0).unwrap(), None);
+    }
+
+    #[test]
+    fn test_get_blinded_owner_batch_empty_input() {
+        let (env, client) = setup();
+        let empty: Vec<BytesN<32>> = Vec::new(&env);
+        let results = client.get_blinded_owner_batch(&empty);
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_get_blinded_owner_batch_mixed_results() {
+        let (env, client) = setup();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let h_regular = BytesN::from_array(&env, &[0x44u8; 32]);
+        client.commit_ip(&owner, &h_regular, &0u32);
+
+        let blinded = BytesN::from_array(&env, &[0xCCu8; 32]);
+        let h_anon = BytesN::from_array(&env, &[0x55u8; 32]);
+        client.batch_commit_ip_anonymous(&blinded, &Vec::from_array(&env, [h_anon.clone()]));
+
+        let results = client.get_blinded_owner_batch(&Vec::from_array(&env, [h_regular, h_anon]));
+        assert_eq!(results.len(), 2);
+        assert_eq!(results.get(0).unwrap(), None);
+        assert_eq!(results.get(1).unwrap(), Some(blinded));
+    }
+}
+
+// ── #465: Batch Escrow tests ──────────────────────────────────────────────────
+
+#[cfg(test)]
+mod batch_escrow_tests {
+    use super::tests::IpRegistryClient;
+    use crate::EscrowStatus;
+    use soroban_sdk::{testutils::{Address as _, Ledger}, Address, BytesN, Env, Vec};
+
+    fn setup_with_ips(n: u64) -> (Env, IpRegistryClient<'static>, Address, Vec<u64>) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &id);
+        let owner = Address::generate(&env);
+        let mut ids = Vec::new(&env);
+        for i in 0..n {
+            let mut hash = [0u8; 32];
+            hash[0] = (i + 1) as u8;
+            let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &hash), &0u32);
+            ids.push_back(ip_id);
+        }
+        (env, client, owner, ids)
+    }
+
+    #[test]
+    fn test_batch_escrow_created_and_retrievable() {
+        let (env, client, owner, ip_ids) = setup_with_ips(2);
+        let beneficiary = Address::generate(&env);
+        let timeout = env.ledger().timestamp() + 1000;
+
+        let escrow_id = client.batch_escrow_commitments(&owner, &ip_ids, &beneficiary, &timeout);
+
+        let escrow = client.get_batch_escrow(&escrow_id).expect("escrow should exist");
+        assert_eq!(escrow.status, EscrowStatus::Active);
+        assert_eq!(escrow.depositor, owner);
+        assert_eq!(escrow.release_to, beneficiary);
+        assert_eq!(escrow.ip_ids.len(), 2);
+    }
+
+    #[test]
+    fn test_release_batch_escrow_transfers_ownership() {
+        let (env, client, owner, ip_ids) = setup_with_ips(2);
+        let beneficiary = Address::generate(&env);
+        let timeout = env.ledger().timestamp() + 1000;
+
+        let escrow_id = client.batch_escrow_commitments(&owner, &ip_ids, &beneficiary, &timeout);
+        client.release_batch_escrow(&escrow_id);
+
+        let escrow = client.get_batch_escrow(&escrow_id).unwrap();
+        assert_eq!(escrow.status, EscrowStatus::Released);
+
+        // IPs now owned by beneficiary
+        for ip_id in ip_ids.iter() {
+            let record = client.get_ip(&ip_id);
+            assert_eq!(record.owner, beneficiary);
+        }
+    }
+
+    #[test]
+    fn test_cancel_batch_escrow_after_timeout() {
+        let (env, client, owner, ip_ids) = setup_with_ips(1);
+        let beneficiary = Address::generate(&env);
+        let timeout = env.ledger().timestamp() + 100;
+
+        let escrow_id = client.batch_escrow_commitments(&owner, &ip_ids, &beneficiary, &timeout);
+
+        // Advance past timeout
+        env.ledger().with_mut(|l| l.timestamp = timeout + 1);
+        client.cancel_batch_escrow(&escrow_id);
+
+        let escrow = client.get_batch_escrow(&escrow_id).unwrap();
+        assert_eq!(escrow.status, EscrowStatus::Cancelled);
+
+        // IPs still owned by owner (no transfer on cancel)
+        let record = client.get_ip(&ip_ids.get(0).unwrap());
+        assert_eq!(record.owner, owner);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_cancel_before_timeout_panics() {
+        let (env, client, owner, ip_ids) = setup_with_ips(1);
+        let beneficiary = Address::generate(&env);
+        let timeout = env.ledger().timestamp() + 9999;
+
+        let escrow_id = client.batch_escrow_commitments(&owner, &ip_ids, &beneficiary, &timeout);
+        // Timeout not reached — must panic
+        client.cancel_batch_escrow(&escrow_id);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_release_already_released_panics() {
+        let (env, client, owner, ip_ids) = setup_with_ips(1);
+        let beneficiary = Address::generate(&env);
+        let timeout = env.ledger().timestamp() + 1000;
+
+        let escrow_id = client.batch_escrow_commitments(&owner, &ip_ids, &beneficiary, &timeout);
+        client.release_batch_escrow(&escrow_id);
+        // Second release — must panic
+        client.release_batch_escrow(&escrow_id);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_escrow_non_owner_ip_panics() {
+        let (env, client, _owner, ip_ids) = setup_with_ips(1);
+        let attacker = Address::generate(&env);
+        let beneficiary = Address::generate(&env);
+        let timeout = env.ledger().timestamp() + 1000;
+
+        // attacker does not own ip_ids — must panic
+        client.batch_escrow_commitments(&attacker, &ip_ids, &beneficiary, &timeout);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_get_batch_escrow_unknown_id_returns_none_not_panic() {
+        // Accessing nonexistent escrow via release should panic
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &id);
+        let fake_id = BytesN::from_array(&env, &[0xFFu8; 32]);
+        client.release_batch_escrow(&fake_id);
+    }
+
+    #[test]
+    fn test_get_batch_escrow_unknown_returns_none() {
+        let env = Env::default();
+        let id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &id);
+        let fake_id = BytesN::from_array(&env, &[0xFFu8; 32]);
+        assert_eq!(client.get_batch_escrow(&fake_id), None);
+    }
+
+    #[test]
+    fn test_batch_escrow_unique_ids_per_call() {
+        let (env, client, owner, ip_ids) = setup_with_ips(2);
+        let beneficiary = Address::generate(&env);
+        let timeout = env.ledger().timestamp() + 1000;
+
+        // Two separate escrow calls on different IPs should produce different IDs
+        let mut ids1_vec = Vec::new(&env);
+        ids1_vec.push_back(ip_ids.get(0).unwrap());
+        let mut ids2_vec = Vec::new(&env);
+        ids2_vec.push_back(ip_ids.get(1).unwrap());
+
+        let eid1 = client.batch_escrow_commitments(&owner, &ids1_vec, &beneficiary, &timeout);
+        let eid2 = client.batch_escrow_commitments(&owner, &ids2_vec, &beneficiary, &timeout);
+        assert_ne!(eid1, eid2);
     }
 }

@@ -155,6 +155,17 @@ batch_verify_commitments(requests) -> Vec<VerifyResult>  // #458: Verify multipl
 assign_ip_to_category(ip_id, category_hash)       // #459: Assign IP to a hierarchical category
 list_ip_by_category(owner, category_hash) -> Vec<u64>    // #459: List IPs in a category
 list_owner_categories(owner) -> Vec<BytesN<32>>   // #459: List all categories for an owner
+
+// #464: Anonymous Batch Commitments
+batch_commit_ip_anonymous(blinded_owner, commitment_hashes) -> Vec<u64>  // Register commitments without revealing submitter
+get_anonymous_owner(commitment_hash) -> Option<BytesN<32>>               // Retrieve blinded owner for anonymous commitment
+get_blinded_owner_batch(commitment_hashes) -> Vec<Option<BytesN<32>>>   // Batch lookup of blinded owners
+
+// #465: Batch Escrow
+batch_escrow_commitments(depositor, ip_ids, release_to, timeout) -> BytesN<32>  // Escrow multiple IPs for conditional release
+get_batch_escrow(escrow_id) -> Option<EscrowRecord>                              // Retrieve escrow record
+release_batch_escrow(escrow_id)                                                  // Release escrowed IPs to beneficiary
+cancel_batch_escrow(escrow_id)                                                   // Cancel escrow after timeout
 ```
 
 ### Atomic Swap
