@@ -4376,6 +4376,12 @@ include!("multi_signer_tests.rs");
 mod batch_swap_features_tests;
 
 #[cfg(test)]
+mod batch_approval_tests;
+
+#[cfg(test)]
+mod batch_history_tests;
+
+#[cfg(test)]
 mod prop_tests;
 
 #[cfg(test)]
