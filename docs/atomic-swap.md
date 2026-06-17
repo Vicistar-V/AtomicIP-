@@ -447,3 +447,191 @@ const encrypted  = encryptBatchSwaps(compressed, key);
 const decrypted  = decryptBatchSwaps(encrypted, key);
 const restored   = decompressBatchSwaps(decrypted);
 ```
+
+
+---
+
+## #465: Batch Escrow for IP Commitments
+
+**Module:** `IpRegistry` contract (`batch_escrow_commitments`, `get_batch_escrow`, `release_batch_escrow`, `cancel_batch_escrow`)
+
+Batch Escrow allows a depositor to hold multiple IP commitments in trust and release them conditionally to a beneficiary after a timeout or manual authorization. This is useful for:
+
+- Conditional IP transfers (e.g., release designs only after payment clears)
+- Time-locked IP releases (e.g., inheritance, delayed asset transfers)
+- Multi-party transactions with contingencies
+
+### Escrow State Machine
+
+```
+┌────────┐       ┌──────────┐
+│ Active │  -->  │ Released │
+└────────┘       └──────────┘
+     │
+     └─────────────> ┌──────────┐
+                     │Cancelled │
+                     └──────────┘
+```
+
+| State | Description |
+|---|---|
+| **Active** | Escrow created; IPs held by contract; no transfers yet |
+| **Released** | Depositor authorized release; all IPs transferred to beneficiary |
+| **Cancelled** | Timeout elapsed; depositor cancelled; IPs returned to depositor (no transfer on cancel) |
+
+### Creating an Escrow
+
+```rust
+let escrow_id: BytesN<32> = ip_registry.batch_escrow_commitments(
+    depositor,        // Address that owns the IPs (requires auth)
+    ip_ids,           // Vec<u64> of IP IDs to hold in escrow
+    release_to,       // Address that will receive IPs upon release
+    timeout,          // Ledger timestamp after which cancellation is allowed
+);
+```
+
+**Security Checks:**
+- Depositor must authorize the call (signature verification)
+- Depositor must own all IPs in `ip_ids`
+- `timeout` must be in the future (contract enforces at release/cancel time)
+- Escrow ID is deterministically derived from `ip_ids + timestamp` to prevent collisions
+
+**Result:**
+- `EscrowRecord` created with `status = Active`
+- `escrow_id` returned (deterministic hash for lookups)
+
+**Events:**
+- `(symbol_short!("escrow"), depositor)` published with `(escrow_id, ip_ids.len())`
+
+### Retrieving an Escrow
+
+```rust
+let escrow: Option<EscrowRecord> = ip_registry.get_batch_escrow(escrow_id);
+```
+
+Returns the escrow record or `None` if not found.
+
+### Releasing an Escrow (Early)
+
+```rust
+ip_registry.release_batch_escrow(escrow_id);
+```
+
+**Security Checks:**
+- Escrow must be in `Active` status
+- Caller must be the depositor (signature verification)
+- No timeout check (depositor can release at any time)
+
+**Result:**
+- All IPs transferred from depositor to `release_to`
+- Escrow status updated to `Released`
+
+**Events:**
+- `(symbol_short!("esc_rel"), depositor)` published with `escrow_id`
+
+**Example:**
+```rust
+// Seller deposits 3 design IPs into escrow for buyer
+let escrow_id = ip_registry.batch_escrow_commitments(
+    seller,
+    vec![design_v1, design_v2, design_v3],
+    buyer,
+    timeout_ts,
+);
+
+// After payment verification, seller manually releases
+ip_registry.release_batch_escrow(escrow_id);
+// → All 3 designs now owned by buyer
+```
+
+### Cancelling an Escrow (After Timeout)
+
+```rust
+ip_registry.cancel_batch_escrow(escrow_id);
+```
+
+**Security Checks:**
+- Escrow must be in `Active` status
+- Caller must be the depositor (signature verification)
+- Current ledger timestamp must be ≥ `escrow.timeout`
+
+**Result:**
+- Escrow status updated to `Cancelled`
+- IPs remain owned by depositor (no transfer occurs on cancel)
+
+**Events:**
+- `(symbol_short!("esc_cnl"), depositor)` published with `escrow_id`
+
+**Example (Inheritance Use Case):**
+```rust
+// Parent deposits family designs to child, with 20-year timeout
+let escrow_id = ip_registry.batch_escrow_commitments(
+    parent,
+    family_designs,
+    child,
+    now + 20_years_in_seconds,
+);
+
+// After 20 years, child automatically cancels and takes ownership
+ip_registry.cancel_batch_escrow(escrow_id);
+// → All designs now owned by child
+```
+
+### Attack Prevention
+
+| Attack | Defense |
+|---|---|
+| **Unauthorized early release** | Only depositor can release; requires signature verification |
+| **Timeout replay** | Ledger timestamp checked at release/cancel time; cannot be spoofed |
+| **Colliding escrow IDs** | ID derived from all `ip_ids + timestamp`; collision risk negligible (2^256 space) |
+| **Double-release** | Status check; escrow must be `Active` to transition to `Released` or `Cancelled` |
+| **Orphaned IPs** | Cancelled escrow does not transfer; IPs revert to depositor ownership |
+
+### Concurrent Escrow Operations
+
+Multiple escrows can exist simultaneously. Each has its own `status`, `timeout`, and `release_to` address.
+
+```rust
+// Create 2 separate escrows for different beneficiaries
+let escrow_1 = ip_registry.batch_escrow_commitments(owner, vec![ip_1, ip_2], alice, t1);
+let escrow_2 = ip_registry.batch_escrow_commitments(owner, vec![ip_3, ip_4], bob, t2);
+
+// Release to Alice, cancel to Bob
+ip_registry.release_batch_escrow(escrow_1); // → ip_1, ip_2 to Alice
+ip_registry.cancel_batch_escrow(escrow_2);  // → ip_3, ip_4 stay with owner
+```
+
+### Gas Optimization
+
+- Batch multiple IPs into a single escrow to reduce transaction overhead
+- Use escrow for conditional transfers only (standard swaps do not require escrow)
+- Cancel expired escrows promptly to free storage
+
+---
+
+## Integration with Atomic Swaps
+
+Batch Escrow in the IP Registry is complementary to atomic swaps in the AtomicSwap contract:
+
+- **Atomic Swaps**: Trustless, instant IP transfer in exchange for payment
+- **Batch Escrow**: Conditional IP transfer with time-lock; no payment involved
+
+**Example: Payment-Contingent Design Transfer**
+```rust
+// 1. Seller deposits designs to escrow (payment not yet confirmed)
+let escrow_id = ip_registry.batch_escrow_commitments(
+    seller,
+    designs,
+    buyer,
+    now + 7_days,
+);
+
+// 2. After payment verified (off-chain or via oracle), seller releases
+ip_registry.release_batch_escrow(escrow_id);
+
+// 3. If payment never confirms, after 7 days buyer can cancel
+// (or seller cancels to reclaim)
+ip_registry.cancel_batch_escrow(escrow_id);
+```
+
+In contrast, atomic swaps verify payment and key in the same transaction (fully trustless).

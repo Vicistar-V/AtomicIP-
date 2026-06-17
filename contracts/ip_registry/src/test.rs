@@ -2796,6 +2796,213 @@ mod batch_escrow_tests {
         assert_ne!(eid1, eid2);
     }
 
+    // ── #465: Timeout Edge Cases ──────────────────────────────────────────────
+
+    #[test]
+    fn test_cancel_at_exact_timeout_boundary() {
+        let (env, client, owner, ip_ids) = setup_with_ips(1);
+        let beneficiary = Address::generate(&env);
+        let timeout = env.ledger().timestamp() + 100;
+
+        let escrow_id = client.batch_escrow_commitments(&owner, &ip_ids, &beneficiary, &timeout);
+
+        // Advance to exactly the timeout timestamp
+        env.ledger().with_mut(|l| l.timestamp = timeout);
+        // Should succeed at exact boundary (timeout <= current_time)
+        client.cancel_batch_escrow(&escrow_id);
+
+        let escrow = client.get_batch_escrow(&escrow_id).unwrap();
+        assert_eq!(escrow.status, EscrowStatus::Cancelled);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_cancel_one_second_before_timeout() {
+        let (env, client, owner, ip_ids) = setup_with_ips(1);
+        let beneficiary = Address::generate(&env);
+        let timeout = env.ledger().timestamp() + 100;
+
+        let escrow_id = client.batch_escrow_commitments(&owner, &ip_ids, &beneficiary, &timeout);
+
+        // Advance to one second before timeout
+        env.ledger().with_mut(|l| l.timestamp = timeout - 1);
+        // Must panic — timeout not reached
+        client.cancel_batch_escrow(&escrow_id);
+    }
+
+    // ── #465: Concurrent Escrow Operations ────────────────────────────────────
+
+    #[test]
+    fn test_multiple_concurrent_escrows_independent() {
+        let (env, client, owner, ip_ids) = setup_with_ips(4);
+        let beneficiary1 = Address::generate(&env);
+        let beneficiary2 = Address::generate(&env);
+        let timeout1 = env.ledger().timestamp() + 100;
+        let timeout2 = env.ledger().timestamp() + 5000;
+
+        // Create first escrow with IPs 0 and 1
+        let mut ids1 = Vec::new(&env);
+        ids1.push_back(ip_ids.get(0).unwrap());
+        ids1.push_back(ip_ids.get(1).unwrap());
+
+        // Create second escrow with IPs 2 and 3
+        let mut ids2 = Vec::new(&env);
+        ids2.push_back(ip_ids.get(2).unwrap());
+        ids2.push_back(ip_ids.get(3).unwrap());
+
+        let escrow_id1 = client.batch_escrow_commitments(&owner, &ids1, &beneficiary1, &timeout1);
+        let escrow_id2 = client.batch_escrow_commitments(&owner, &ids2, &beneficiary2, &timeout2);
+
+        // Verify both escrows exist independently
+        let escrow1 = client.get_batch_escrow(&escrow_id1).unwrap();
+        let escrow2 = client.get_batch_escrow(&escrow_id2).unwrap();
+
+        assert_eq!(escrow1.status, EscrowStatus::Active);
+        assert_eq!(escrow2.status, EscrowStatus::Active);
+        assert_eq!(escrow1.release_to, beneficiary1);
+        assert_eq!(escrow2.release_to, beneficiary2);
+
+        // Release first escrow
+        client.release_batch_escrow(&escrow_id1);
+
+        // Verify first is released, second still active
+        assert_eq!(
+            client.get_batch_escrow(&escrow_id1).unwrap().status,
+            EscrowStatus::Released
+        );
+        assert_eq!(
+            client.get_batch_escrow(&escrow_id2).unwrap().status,
+            EscrowStatus::Active
+        );
+
+        // Verify IPs transferred correctly
+        for ip_id in ids1.iter() {
+            let record = client.get_ip(&ip_id);
+            assert_eq!(record.owner, beneficiary1);
+        }
+        for ip_id in ids2.iter() {
+            let record = client.get_ip(&ip_id);
+            assert_eq!(record.owner, owner); // Still owned by owner (escrow 2 not released)
+        }
+    }
+
+    #[test]
+    fn test_concurrent_cancel_and_release_different_escrows() {
+        let (env, client, owner, ip_ids) = setup_with_ips(2);
+        let beneficiary1 = Address::generate(&env);
+        let beneficiary2 = Address::generate(&env);
+        let timeout1 = env.ledger().timestamp() + 50;
+        let timeout2 = env.ledger().timestamp() + 5000;
+
+        let mut ids1 = Vec::new(&env);
+        ids1.push_back(ip_ids.get(0).unwrap());
+        let mut ids2 = Vec::new(&env);
+        ids2.push_back(ip_ids.get(1).unwrap());
+
+        let escrow_id1 = client.batch_escrow_commitments(&owner, &ids1, &beneficiary1, &timeout1);
+        let escrow_id2 = client.batch_escrow_commitments(&owner, &ids2, &beneficiary2, &timeout2);
+
+        // Advance time past timeout1 but not timeout2
+        env.ledger().with_mut(|l| l.timestamp = timeout1 + 1);
+
+        // Cancel first escrow (past timeout)
+        client.cancel_batch_escrow(&escrow_id1);
+
+        // Release second escrow (depositor can release anytime)
+        client.release_batch_escrow(&escrow_id2);
+
+        // Verify states
+        assert_eq!(
+            client.get_batch_escrow(&escrow_id1).unwrap().status,
+            EscrowStatus::Cancelled
+        );
+        assert_eq!(
+            client.get_batch_escrow(&escrow_id2).unwrap().status,
+            EscrowStatus::Released
+        );
+
+        // IP from cancelled escrow stays with owner
+        assert_eq!(client.get_ip(&ip_ids.get(0).unwrap()).owner, owner);
+        // IP from released escrow goes to beneficiary
+        assert_eq!(
+            client.get_ip(&ip_ids.get(1).unwrap()).owner,
+            beneficiary2
+        );
+    }
+
+    // ── #465: Malicious Release Attempts ──────────────────────────────────────
+
+    #[test]
+    #[should_panic]
+    fn test_release_cancelled_escrow_panics() {
+        let (env, client, owner, ip_ids) = setup_with_ips(1);
+        let beneficiary = Address::generate(&env);
+        let timeout = env.ledger().timestamp() + 50;
+
+        let escrow_id = client.batch_escrow_commitments(&owner, &ip_ids, &beneficiary, &timeout);
+
+        // Advance past timeout and cancel
+        env.ledger().with_mut(|l| l.timestamp = timeout + 1);
+        client.cancel_batch_escrow(&escrow_id);
+
+        // Try to release cancelled escrow — must panic
+        client.release_batch_escrow(&escrow_id);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_cancel_released_escrow_panics() {
+        let (env, client, owner, ip_ids) = setup_with_ips(1);
+        let beneficiary = Address::generate(&env);
+        let timeout = env.ledger().timestamp() + 5000;
+
+        let escrow_id = client.batch_escrow_commitments(&owner, &ip_ids, &beneficiary, &timeout);
+
+        // Release escrow
+        client.release_batch_escrow(&escrow_id);
+
+        // Try to cancel released escrow — must panic
+        client.cancel_batch_escrow(&escrow_id);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_large_batch_escrow() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &id);
+        let owner = Address::generate(&env);
+        let beneficiary = Address::generate(&env);
+
+        // Create 50 IPs
+        let mut ids = Vec::new(&env);
+        for i in 0..50u64 {
+            let mut hash = [0u8; 32];
+            hash[0] = (i & 0xFF) as u8;
+            hash[1] = ((i >> 8) & 0xFF) as u8;
+            let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &hash), &0u32);
+            ids.push_back(ip_id);
+        }
+
+        let timeout = env.ledger().timestamp() + 1000;
+
+        // Create escrow with all 50 IPs
+        let escrow_id = client.batch_escrow_commitments(&owner, &ids, &beneficiary, &timeout);
+
+        // Release and verify all IPs transferred
+        client.release_batch_escrow(&escrow_id);
+
+        let escrow = client.get_batch_escrow(&escrow_id).unwrap();
+        assert_eq!(escrow.status, EscrowStatus::Released);
+        assert_eq!(escrow.ip_ids.len(), 50);
+
+        for ip_id in ids.iter() {
+            let record = client.get_ip(&ip_id);
+            assert_eq!(record.owner, beneficiary);
+        }
+    }
+
     // ── #464: Anonymity Tests ─────────────────────────────────────────────────
 
     /// Verify that replaying the same blinded_owner in a second batch is rejected.
