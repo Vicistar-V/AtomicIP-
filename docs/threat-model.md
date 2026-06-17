@@ -291,3 +291,110 @@ For users:
 ## Reporting Vulnerabilities
 
 See [SECURITY.md](../SECURITY.md) for responsible disclosure process.
+
+---
+
+## Anonymity Guarantees — #464 Anonymous Batch IP Commitments
+
+### Overview
+
+`batch_commit_ip_anonymous` lets submitters register IP commitments without
+linking the transaction to a real identity. This section documents the
+cryptographic model, what anonymity properties hold, and where residual risks
+remain.
+
+### How Blinded Owner Identifiers Work
+
+The caller supplies a `blinded_owner: BytesN<32>` value instead of a real
+`Address`. The recommended construction off-chain is:
+
+```
+blinded_owner = sha256(owner_address_bytes || random_nonce_32_bytes)
+```
+
+Only the `blinded_owner` hash is written on-chain — never the raw address or
+nonce. An observer with access to the full ledger history cannot reverse this
+hash to recover the original address without knowing the nonce.
+
+### Anonymity Properties
+
+| Property | Guarantee |
+|---|---|
+| Submitter unlinkability | The `IpRecord.owner` field is set to the contract address, not the caller. No on-chain index links the record to any `Address`. |
+| Blinded-owner confidentiality | `blinded_owner` is a one-way hash; the original address + nonce pair cannot be recovered without the nonce. |
+| Ownership indexing bypass | Anonymous commits intentionally skip the `OwnerIps` index, so `list_ip_by_owner` returns an empty list for any address. |
+| Batch grouping resistance | Each batch must use a fresh `blinded_owner`. The replay protection prevents linking two batches to the same identity via nonce reuse. |
+
+### Nonce-Based Replay Protection
+
+Each `blinded_owner` value is consumed atomically on first use and stored under
+`DataKey::UsedBlindedOwner(blinded_owner)`. A second call with an identical
+`blinded_owner` panics with `CommitmentAlreadyRegistered` (error code 3).
+
+This means:
+
+- A given `blinded_owner = sha256(address || nonce)` submits **exactly one
+  batch** per nonce.
+- An attacker who observes the `blinded_owner` on-chain cannot replay it to
+  register additional commitments under the same pseudonym.
+- Submitters who need multiple batches must generate a fresh nonce for each.
+
+### Threat Scenarios
+
+#### 16. Blinded Owner Replay
+
+**Scenario**: Attacker copies a `blinded_owner` from a historical transaction
+and attempts to register new commitments under that identity.
+
+**Impact**: Forged ownership linkage under another party's pseudonym.
+
+**Mitigation**: `UsedBlindedOwner` map rejects the second call immediately.
+
+**Status**: ✅ Mitigated
+
+---
+
+#### 17. Blinded Owner Brute-Force / Correlation
+
+**Scenario**: Adversary iterates over known Stellar addresses to find a
+match for an observed `blinded_owner` by computing `sha256(address || nonce)`
+for each candidate.
+
+**Impact**: De-anonymization of the submitter.
+
+**Mitigation**:
+- The nonce must be 32 bytes of cryptographically random data, making the
+  search space 2^256 even if the address is known.
+- Wallets **must** use a CSPRNG (e.g. `crypto.getRandomValues`) for nonce
+  generation; deterministic or low-entropy nonces weaken this guarantee.
+
+**Status**: ✅ Mitigated — provided callers use a secure nonce
+
+---
+
+#### 18. Traffic Analysis / Timing Correlation
+
+**Scenario**: Adversary correlates the ledger timestamp and transaction fee
+payer of an anonymous commit to a known address.
+
+**Impact**: Partial de-anonymization via side-channel.
+
+**Mitigation**:
+- This is a **residual risk**. The protocol cannot hide the fee account on
+  Stellar.
+- Users requiring stronger anonymity should route submissions through an
+  intermediary account (e.g. a relayer), or batch alongside other users.
+
+**Status**: ⚠️ Residual risk — fee-account linkage is unavoidable at the
+network layer
+
+---
+
+### Operator Recommendations
+
+| Concern | Required Action |
+|---|---|
+| Nonce quality | Enforce 32-byte CSPRNG nonce in all SDKs and wallet integrations; reject user-supplied low-entropy nonces |
+| Blinded owner reuse | Document that each batch requires a fresh nonce; warn if SDK detects reuse |
+| Fee account exposure | Advise privacy-sensitive users to use a fresh throwaway account as the transaction fee payer |
+| Audit trail | `"ip_cmt_a"` events are emitted per commitment; monitor for unusual batch sizes that may indicate Sybil behaviour |

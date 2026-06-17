@@ -12,8 +12,8 @@ use types::*;
 
 // FIXME: test.rs has compilation errors from merge conflict - re-enable after fix
 // FIXME: test.rs has pre-existing compilation errors from a merge conflict - fix before enabling
-// #[cfg(test)]
-// mod test;
+#[cfg(test)]
+mod test;
 
 // FIXME: benchmarks.rs has pre-existing compilation errors from a merge conflict
 // #[cfg(test)]
@@ -124,6 +124,8 @@ pub enum DataKey {
     CommitmentOwner(BytesN<32>), // tracks which owner already holds a commitment hash
     /// Maps commitment hash -> blinded owner identifier for anonymous commits
     AnonymousOwner(BytesN<32>),
+    /// #464: Tracks blinded_owner values that have already been used for replay protection
+    UsedBlindedOwner(BytesN<32>),
     Admin,
     PartialDisclosure(u64), // stores partial_hash for a given ip_id after reveal
     IpLicenses(u64),        // stores license entries for a given ip_id
@@ -356,7 +358,7 @@ pub enum EscrowStatus {
 
 /// Escrow record for multiple commitments held in trust.
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct EscrowRecord {
     pub escrow_id: BytesN<32>,
     pub depositor: Address,
@@ -800,6 +802,22 @@ impl IpRegistry {
                 ContractError::ZeroCommitmentHash as u32,
             ));
         }
+
+        // #464: Replay protection — reject if this blinded_owner has already been used.
+        // A blinded_owner is sha256(real_owner || nonce); reusing it would link
+        // multiple batches to the same blinded identity, undermining anonymity.
+        if env.storage().persistent().has(&DataKey::UsedBlindedOwner(blinded_owner.clone())) {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::CommitmentAlreadyRegistered as u32,
+            ));
+        }
+        // Mark this blinded_owner as consumed before writing any commitments.
+        env.storage().persistent().set(&DataKey::UsedBlindedOwner(blinded_owner.clone()), &true);
+        env.storage().persistent().extend_ttl(
+            &DataKey::UsedBlindedOwner(blinded_owner.clone()),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
 
         // Initialize admin on first call if not set
         if !env.storage().persistent().has(&DataKey::Admin) {
