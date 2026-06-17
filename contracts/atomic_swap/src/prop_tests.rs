@@ -20,7 +20,15 @@ mod prop_tests {
 
     fn setup_env_with_swap(
         price: i128,
-    ) -> (Env, AtomicSwapClient<'static>, u64, BytesN<32>, BytesN<32>, Address, Address) {
+    ) -> (
+        Env,
+        AtomicSwapClient<'static>,
+        u64,
+        BytesN<32>,
+        BytesN<32>,
+        Address,
+        Address,
+    ) {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -51,7 +59,9 @@ mod prop_tests {
         let client = AtomicSwapClient::new(&env, &contract_id);
         client.initialize(&registry_id);
 
-        client.initiate_swap(&token_id, &ip_id, &seller, &price, &buyer, &0_u32, &None, &false);
+        client.initiate_swap(
+            &token_id, &ip_id, &seller, &price, &buyer, &0_u32, &None, &false,
+        );
 
         (env, client, ip_id, secret, blinding, seller, buyer)
     }
@@ -337,14 +347,18 @@ mod prop_tests {
         let hash: BytesN<32> = env.crypto().sha256(&preimage).into();
         let ip_id = registry.commit_ip(&seller, &hash);
 
-        let token_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
         StellarAssetClient::new(&env, &token_id).mint(&buyer, &1000);
 
         let contract_id = env.register(AtomicSwap, ());
         let client = AtomicSwapClient::new(&env, &contract_id);
         client.initialize(&registry_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &1000, &buyer, &0_u32, &None, &false);
+        let swap_id = client.initiate_swap(
+            &token_id, &ip_id, &seller, &1000, &buyer, &0_u32, &None, &false,
+        );
         // Must panic: SwapNotAccepted = 8
         client.reveal_key(&swap_id, &seller, &secret, &blinding);
     }
@@ -370,14 +384,18 @@ mod prop_tests {
         let hash: BytesN<32> = env.crypto().sha256(&preimage).into();
         let ip_id = registry.commit_ip(&seller, &hash);
 
-        let token_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
         StellarAssetClient::new(&env, &token_id).mint(&buyer, &1000);
 
         let contract_id = env.register(AtomicSwap, ());
         let client = AtomicSwapClient::new(&env, &contract_id);
         client.initialize(&registry_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &1000, &buyer, &0_u32, &None, &false);
+        let swap_id = client.initiate_swap(
+            &token_id, &ip_id, &seller, &1000, &buyer, &0_u32, &None, &false,
+        );
         client.cancel_swap(&swap_id);
         // Must panic: SwapNotPending = 6
         client.accept_swap(&swap_id);
@@ -404,14 +422,18 @@ mod prop_tests {
         let hash: BytesN<32> = env.crypto().sha256(&preimage).into();
         let ip_id = registry.commit_ip(&seller, &hash);
 
-        let token_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
         StellarAssetClient::new(&env, &token_id).mint(&buyer, &1000);
 
         let contract_id = env.register(AtomicSwap, ());
         let client = AtomicSwapClient::new(&env, &contract_id);
         client.initialize(&registry_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &1000, &buyer, &0_u32, &None, &false);
+        let swap_id = client.initiate_swap(
+            &token_id, &ip_id, &seller, &1000, &buyer, &0_u32, &None, &false,
+        );
         client.accept_swap(&swap_id);
 
         let wrong_secret = BytesN::from_array(&env, &[0xFFu8; 32]);
@@ -441,14 +463,18 @@ mod prop_tests {
         let hash: BytesN<32> = env.crypto().sha256(&preimage).into();
         let ip_id = registry.commit_ip(&seller, &hash);
 
-        let token_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
         StellarAssetClient::new(&env, &token_id).mint(&buyer, &2000);
 
         let contract_id = env.register(AtomicSwap, ());
         let client = AtomicSwapClient::new(&env, &contract_id);
         client.initialize(&registry_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &1000, &buyer, &0_u32, &None, &false);
+        let swap_id = client.initiate_swap(
+            &token_id, &ip_id, &seller, &1000, &buyer, &0_u32, &None, &false,
+        );
         client.accept_swap(&swap_id);
         // Must panic: SwapNotPending = 6
         client.accept_swap(&swap_id);
@@ -475,15 +501,21 @@ mod prop_tests {
         let hash: BytesN<32> = env.crypto().sha256(&preimage).into();
         let ip_id = registry.commit_ip(&seller, &hash);
 
-        let token_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
         StellarAssetClient::new(&env, &token_id).mint(&buyer, &2000);
 
         let contract_id = env.register(AtomicSwap, ());
         let client = AtomicSwapClient::new(&env, &contract_id);
         client.initialize(&registry_id);
 
-        client.initiate_swap(&token_id, &ip_id, &seller, &1000, &buyer, &0_u32, &None, &false);
+        client.initiate_swap(
+            &token_id, &ip_id, &seller, &1000, &buyer, &0_u32, &None, &false,
+        );
         // Must panic: ActiveSwapAlreadyExistsForThisIpId = 5
-        client.initiate_swap(&token_id, &ip_id, &seller, &500, &buyer, &0_u32, &None, &false);
+        client.initiate_swap(
+            &token_id, &ip_id, &seller, &500, &buyer, &0_u32, &None, &false,
+        );
     }
 }

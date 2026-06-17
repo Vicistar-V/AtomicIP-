@@ -59,18 +59,28 @@ mod tests {
         let client = AtomicSwapClient::new(&env, &contract_id);
 
         let timeout = env.ledger().timestamp() + 3600;
-        let swap_id = client.initiate_escrow_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &timeout);
+        let swap_id =
+            client.initiate_escrow_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &timeout);
 
         // Swap is Pending after initiation
-        assert_eq!(client.get_swap(&swap_id).unwrap().status, SwapStatus::Pending);
+        assert_eq!(
+            client.get_swap(&swap_id).unwrap().status,
+            SwapStatus::Pending
+        );
 
         // Buyer deposits — moves to Accepted
         client.escrow_deposit(&swap_id);
-        assert_eq!(client.get_swap(&swap_id).unwrap().status, SwapStatus::Accepted);
+        assert_eq!(
+            client.get_swap(&swap_id).unwrap().status,
+            SwapStatus::Accepted
+        );
 
         // Seller reveals key — completes the swap
         client.reveal_key(&swap_id, &seller, &secret, &blinding);
-        assert_eq!(client.get_swap(&swap_id).unwrap().status, SwapStatus::Completed);
+        assert_eq!(
+            client.get_swap(&swap_id).unwrap().status,
+            SwapStatus::Completed
+        );
     }
 
     /// Buyer withdraws after timeout when seller never reveals.
@@ -89,14 +99,18 @@ mod tests {
         let client = AtomicSwapClient::new(&env, &contract_id);
 
         let timeout = env.ledger().timestamp() + 100;
-        let swap_id = client.initiate_escrow_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &timeout);
+        let swap_id =
+            client.initiate_escrow_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &timeout);
         client.escrow_deposit(&swap_id);
 
         // Advance ledger past timeout
         env.ledger().with_mut(|l| l.timestamp = timeout + 1);
 
         client.escrow_withdraw(&swap_id);
-        assert_eq!(client.get_swap(&swap_id).unwrap().status, SwapStatus::Cancelled);
+        assert_eq!(
+            client.get_swap(&swap_id).unwrap().status,
+            SwapStatus::Cancelled
+        );
     }
 
     /// Withdraw before timeout must panic.
@@ -116,7 +130,8 @@ mod tests {
         let client = AtomicSwapClient::new(&env, &contract_id);
 
         let timeout = env.ledger().timestamp() + 9999;
-        let swap_id = client.initiate_escrow_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &timeout);
+        let swap_id =
+            client.initiate_escrow_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &timeout);
         client.escrow_deposit(&swap_id);
 
         // Timeout has NOT passed — must panic
@@ -140,7 +155,9 @@ mod tests {
         let client = AtomicSwapClient::new(&env, &contract_id);
 
         // Regular atomic swap
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None, &0_i128, &false);
+        let swap_id = client.initiate_swap(
+            &token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None, &0_i128, &false,
+        );
 
         // escrow_deposit on an atomic swap must panic
         client.escrow_deposit(&swap_id);
@@ -163,7 +180,8 @@ mod tests {
         let client = AtomicSwapClient::new(&env, &contract_id);
 
         let timeout = env.ledger().timestamp() + 3600;
-        let swap_id = client.initiate_escrow_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &timeout);
+        let swap_id =
+            client.initiate_escrow_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &timeout);
         client.escrow_deposit(&swap_id);
         client.escrow_deposit(&swap_id); // second deposit — must panic
     }
@@ -184,15 +202,15 @@ mod tests {
         let client = AtomicSwapClient::new(&env, &contract_id);
 
         let timeout = env.ledger().timestamp() + 3600;
-        let swap_id = client.initiate_escrow_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &timeout);
+        let swap_id =
+            client.initiate_escrow_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &timeout);
 
-        let mode: SwapMode = env
-            .as_contract(&contract_id, || {
-                env.storage()
-                    .persistent()
-                    .get(&crate::DataKey::SwapMode(swap_id))
-                    .unwrap()
-            });
+        let mode: SwapMode = env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .get(&crate::DataKey::SwapMode(swap_id))
+                .unwrap()
+        });
         assert_eq!(mode, SwapMode::Escrow);
     }
 }

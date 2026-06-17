@@ -223,6 +223,13 @@ pub struct DisputeEvidenceSubmittedEvent {
     pub evidence_hash: BytesN<32>,
 }
 
+#[contracttype]
+#[derive(Clone)]
+pub struct BatchSignedEvent {
+    pub swap_ids: soroban_sdk::Vec<u64>,
+    pub signer: Address,
+}
+
 // ── #347: Auction Types ───────────────────────────────────────────────────────
 
 #[contracttype]
@@ -309,7 +316,6 @@ pub struct CollateralRefundedEvent {
     pub buyer: Address,
     pub collateral_amount: i128,
 }
-
 
 // ── #355: Arbitration Request Event ───────────────────────────────────────────
 

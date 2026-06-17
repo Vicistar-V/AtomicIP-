@@ -16,8 +16,11 @@ pub const TRANSFER_TOPIC: Symbol = soroban_sdk::symbol_short!("ip_xfer");
 
 /// Access tier constants for tiered IP access control.
 /// Tiers are hierarchical: transfer implies verify, verify implies view.
-pub const ACCESS_VIEW: u32 = 1;     // Can read IP metadata
-pub const ACCESS_VERIFY: u32 = 2;   // Can verify the commitment (view + verify)
+#[allow(dead_code)]
+pub const ACCESS_VIEW: u32 = 1; // Can read IP metadata
+#[allow(dead_code)]
+pub const ACCESS_VERIFY: u32 = 2; // Can verify the commitment (view + verify)
+#[allow(dead_code)]
 pub const ACCESS_TRANSFER: u32 = 3; // Can initiate transfer (view + verify + transfer)
 
 #[contracttype]
@@ -37,19 +40,19 @@ pub enum DataKey {
     NextId,
     CommitmentOwner(BytesN<32>), // tracks which owner already holds a commitment hash
     Admin,
-    CategoryIps(BytesN<32>), // maps category hash -> Vec<u64> of IP IDs
-    IpLineage(u64),          // stores parent_ip_id for versioning
-    IpVersions(u64),         // stores Vec<u64> of all version IDs for a given IP
-    IpCommitmentChecksum,    // Issue #346: stores hash of all commitments for rollback protection
-    IpAccessGrants(u64),     // Issue #344: stores Vec of (grantee, access_level) for tiered access
-    NotarySignature(u64),    // Issue #345: stores notary signature for timestamp notarization
-    IpVersionChain(u64),     // stores Vec<u64> of the full version chain rooted at a given IP
+    CategoryIps(BytesN<32>),    // maps category hash -> Vec<u64> of IP IDs
+    IpLineage(u64),             // stores parent_ip_id for versioning
+    IpVersions(u64),            // stores Vec<u64> of all version IDs for a given IP
+    IpCommitmentChecksum, // Issue #346: stores hash of all commitments for rollback protection
+    IpAccessGrants(u64),  // Issue #344: stores Vec of (grantee, access_level) for tiered access
+    NotarySignature(u64), // Issue #345: stores notary signature for timestamp notarization
+    IpVersionChain(u64),  // stores Vec<u64> of the full version chain rooted at a given IP
     OwnershipChallenge(u64), // Issue #433: stores OwnershipChallenge for a given challenge_id
-    NextChallengeId,         // Issue #433: monotonic challenge ID counter
+    NextChallengeId,      // Issue #433: monotonic challenge ID counter
     EncryptionKeyRotation(u64), // Issue #434: stores Vec<BytesN<32>> of old commitment hashes
-    MerkleRoot(Address),     // Issue #435: cached Merkle root for an owner's commitment set
-    NotaryPublicKey,         // Issue #428: stores the trusted notary Ed25519 public key (32 bytes)
-    CommitmentHashes,        // Issue #429: stores Vec<BytesN<32>> of all commitment hashes for rollback protection
+    MerkleRoot(Address),  // Issue #435: cached Merkle root for an owner's commitment set
+    NotaryPublicKey,      // Issue #428: stores the trusted notary Ed25519 public key (32 bytes)
+    CommitmentHashes, // Issue #429: stores Vec<BytesN<32>> of all commitment hashes for rollback protection
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────

@@ -7,7 +7,7 @@
 mod benchmarks {
     use ip_registry::{IpRegistry, IpRegistryClient};
     use soroban_sdk::{
-        testutils::{Address as _, budget::Budget},
+        testutils::{budget::Budget, Address as _},
         token::StellarAssetClient,
         Address, Bytes, BytesN, Env,
     };
@@ -44,7 +44,12 @@ mod benchmarks {
         let swap_id = env.register(AtomicSwap, ());
         let swap = AtomicSwapClient::new(&env, &swap_id);
         swap.initialize(&registry_id);
-        BenchCtx { env, swap, token, registry_id }
+        BenchCtx {
+            env,
+            swap,
+            token,
+            registry_id,
+        }
     }
 
     fn commit_ip(ctx: &BenchCtx, seller: &Address, seed: u8) -> (u64, BytesN<32>, BytesN<32>) {
@@ -65,7 +70,9 @@ mod benchmarks {
         StellarAssetClient::new(&ctx.env, &ctx.token).mint(&buyer, &1000);
 
         ctx.env.budget().reset_default();
-        ctx.swap.initiate_swap(&ctx.token, &ip_id, &seller, &1000, &buyer, &0_u32, &None, &0i128, &false);
+        ctx.swap.initiate_swap(
+            &ctx.token, &ip_id, &seller, &1000, &buyer, &0_u32, &None, &0i128, &false,
+        );
         let cpu = ctx.env.budget().cpu_instruction_count();
 
         assert!(

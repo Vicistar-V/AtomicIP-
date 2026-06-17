@@ -54,7 +54,12 @@ mod chaos_tests {
         let swap = AtomicSwapClient::new(&env, &swap_id);
         swap.initialize(&registry_id);
 
-        let ctx = TestContext { env, swap, registry, token };
+        let ctx = TestContext {
+            env,
+            swap,
+            registry,
+            token,
+        };
         (ctx, ip_id, secret, blinding, seller, buyer)
     }
 
@@ -227,7 +232,10 @@ mod chaos_tests {
             swap.accept_swap(&swap_id);
             swap.reveal_key(&swap_id, &seller, &secret, &blinding);
 
-            assert_eq!(swap.get_swap(&swap_id).unwrap().status, SwapStatus::Completed);
+            assert_eq!(
+                swap.get_swap(&swap_id).unwrap().status,
+                SwapStatus::Completed
+            );
         }
     }
 }
