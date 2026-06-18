@@ -68,8 +68,14 @@ mod snapshot_tests {
         c.revoke_ip(&id);
 
         let record = c.get_ip(&id);
-        assert!(record.revoked, "snapshot must show revoked=true after revoke_ip");
-        assert_eq!(record.commitment_hash, hash, "hash must not change on revoke");
+        assert!(
+            record.revoked,
+            "snapshot must show revoked=true after revoke_ip"
+        );
+        assert_eq!(
+            record.commitment_hash, hash,
+            "hash must not change on revoke"
+        );
     }
 
     // ── owner index snapshot ──────────────────────────────────────────────────

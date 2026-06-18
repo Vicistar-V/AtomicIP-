@@ -84,11 +84,8 @@ pub fn fetch_oracle_price(env: &Env, token: &Address) -> i128 {
     // Cross-contract call: oracle must expose `get_price(token: Address) -> i128`
     let mut args: soroban_sdk::Vec<Val> = soroban_sdk::Vec::new(env);
     args.push_back(token.into_val(env));
-    let price: i128 = env.invoke_contract(
-        &config.oracle_address,
-        &symbol_short!("get_price"),
-        args,
-    );
+    let price: i128 =
+        env.invoke_contract(&config.oracle_address, &symbol_short!("get_price"), args);
 
     if price <= 0 {
         env.panic_with_error(soroban_sdk::Error::from_contract_error(

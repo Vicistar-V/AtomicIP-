@@ -827,9 +827,67 @@ client.batch_update_reputation(&ip_ids, &score_deltas);
 
 Organises IP commitments in a two-level hierarchy: `owner → category → ip_ids`. This enables O(1) category-scoped lookups without scanning the full owner index.
 
+### Category Schema
+
+Categories are human-readable hierarchical paths (e.g. `"Software/Cryptography/ZK-Proofs"`)
+that are hashed with SHA-256 to produce a 32-byte category hash for on-chain storage.
+
+**Constants:**
+
+| Constant | Value | Description |
+|---|---|---|
+| `MAX_CATEGORY_DEPTH` | `10` | Maximum number of segments in a category path |
+
+**Types:**
+
+```rust
+/// Metadata for a registered category path.
+pub struct CategoryInfo {
+    pub path: Bytes,  // full category path e.g. "Software/Cryptography/ZK-Proofs"
+    pub depth: u32,   // number of segments (3 for the example above)
+}
+```
+
+**Error Codes:**
+
+| Error | Code | Description |
+|---|---|---|
+| `InvalidCategoryHash` | 32 | Category hash is all zeros |
+| `InvalidCategoryDepth` | 33 | Category path exceeds `MAX_CATEGORY_DEPTH` |
+| `CategoryNotFound` | 34 | Category hash not registered |
+
+### `register_category_path`
+
+Register a category path and compute its hash. Stores the depth for subsequent validation.
+
+```rust
+pub fn register_category_path(env: Env, path: Bytes) -> BytesN<32>
+```
+
+| Parameter | Type | Description |
+|---|---|---|
+| `path` | `Bytes` | Human-readable path, e.g. `b"Software/Cryptography/ZK-Proofs"` |
+
+**Returns:** The SHA-256 hash of the path as `BytesN<32>`.
+
+Panics with `InvalidCategoryDepth` if the path exceeds `MAX_CATEGORY_DEPTH` segments.
+
+### `validate_category`
+
+Validate that a category hash is registered and has a valid depth.
+
+```rust
+pub fn validate_category(env: Env, category_hash: BytesN<32>)
+```
+
+Panics with `InvalidCategoryHash` if the hash is all zeros, `CategoryNotFound` if the
+category has not been registered, or `InvalidCategoryDepth` if the stored depth exceeds
+the maximum.
+
 ### `assign_ip_to_category`
 
-Assign an IP to a category within the owner's hierarchy. Only the IP owner may call this.
+Assign an IP to a registered category within the owner's hierarchy. Only the IP owner
+may call this. The category must have been previously registered via `register_category_path`.
 
 ```rust
 pub fn assign_ip_to_category(env: Env, ip_id: u64, category_hash: BytesN<32>)
@@ -838,9 +896,11 @@ pub fn assign_ip_to_category(env: Env, ip_id: u64, category_hash: BytesN<32>)
 | Parameter | Type | Description |
 |---|---|---|
 | `ip_id` | `u64` | The IP to categorise |
-| `category_hash` | `BytesN<32>` | 32-byte hash identifying the category (e.g. `sha256(label)`) |
+| `category_hash` | `BytesN<32>` | 32-byte hash identifying the category (from `register_category_path`) |
 
-Panics with `IpNotFound` if the IP does not exist, or auth error if caller is not the owner. Duplicate assignments are silently ignored.
+Panics with `IpNotFound` if the IP does not exist, `InvalidCategoryHash` if the hash
+is invalid, `CategoryNotFound` if unregistered, or auth error if caller is not the owner.
+Duplicate assignments are silently ignored.
 
 ### `list_ip_by_category`
 
@@ -865,9 +925,14 @@ Returns an empty vector if the owner has no categories.
 #### Example
 
 ```rust
-let category = env.crypto().sha256(&Bytes::from_slice(&env, b"patents"));
-client.assign_ip_to_category(&ip_id, &category);
+// Register a hierarchical category
+let path = Bytes::from_slice(&env, b"Software/Cryptography/ZK-Proofs");
+let cat_hash = client.register_category_path(&path);
 
-let ids = client.list_ip_by_category(&owner, &category);
+// Assign IP to category
+client.assign_ip_to_category(&ip_id, &cat_hash);
+
+// Query
+let ids = client.list_ip_by_category(&owner, &cat_hash);
 let cats = client.list_owner_categories(&owner);
 ```

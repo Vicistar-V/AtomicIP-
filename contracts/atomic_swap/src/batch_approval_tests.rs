@@ -2,12 +2,10 @@
 mod batch_approval_tests {
     use ip_registry::{IpRegistry, IpRegistryClient};
     use soroban_sdk::{
-        testutils::Address as _,
-        token::StellarAssetClient,
-        Address, Bytes, BytesN, Env, Vec,
+        testutils::Address as _, token::StellarAssetClient, Address, Bytes, BytesN, Env, Vec,
     };
 
-    use crate::{AtomicSwap, AtomicSwapClient, SwapStatus, ContractError, Error};
+    use crate::{AtomicSwap, AtomicSwapClient, ContractError, Error, SwapStatus};
 
     fn setup_registry(env: &Env, owner: &Address) -> Address {
         let registry_id = env.register(IpRegistry, ());
@@ -15,7 +13,12 @@ mod batch_approval_tests {
         registry_id
     }
 
-    fn commit_ip(env: &Env, registry_id: &Address, owner: &Address, seed: u8) -> (u64, BytesN<32>, BytesN<32>) {
+    fn commit_ip(
+        env: &Env,
+        registry_id: &Address,
+        owner: &Address,
+        seed: u8,
+    ) -> (u64, BytesN<32>, BytesN<32>) {
         let registry = IpRegistryClient::new(env, registry_id);
         let secret = BytesN::from_array(env, &[seed; 32]);
         let blinding = BytesN::from_array(env, &[seed.wrapping_add(0x80); 32]);
@@ -28,7 +31,9 @@ mod batch_approval_tests {
     }
 
     fn setup_token(env: &Env, admin: &Address, recipient: &Address, amount: i128) -> Address {
-        let token_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
         StellarAssetClient::new(env, &token_id).mint(recipient, &amount);
         token_id
     }
@@ -64,12 +69,11 @@ mod batch_approval_tests {
         let mut prices = Vec::new(&env);
         prices.push_back(1000i128);
 
-        let swap_ids = client.batch_initiate_swap(
-            &token_id, &ip_ids, &seller, &prices, &buyer, &1u32, &None,
-        );
+        let swap_ids =
+            client.batch_initiate_swap(&token_id, &ip_ids, &seller, &prices, &buyer, &1u32, &None);
 
         let swap_id = swap_ids.get(0).unwrap();
-        
+
         // Approve with required approvals = 1
         client.approve_swap(&swap_id, &approver1);
 
@@ -103,9 +107,8 @@ mod batch_approval_tests {
         let mut prices = Vec::new(&env);
         prices.push_back(1000i128);
 
-        let swap_ids = client.batch_initiate_swap(
-            &token_id, &ip_ids, &seller, &prices, &buyer, &3u32, &None,
-        );
+        let swap_ids =
+            client.batch_initiate_swap(&token_id, &ip_ids, &seller, &prices, &buyer, &3u32, &None);
 
         let swap_id = swap_ids.get(0).unwrap();
 
@@ -143,19 +146,18 @@ mod batch_approval_tests {
         let mut prices = Vec::new(&env);
         prices.push_back(1000i128);
 
-        let swap_ids = client.batch_initiate_swap(
-            &token_id, &ip_ids, &seller, &prices, &buyer, &2u32, &None,
-        );
+        let swap_ids =
+            client.batch_initiate_swap(&token_id, &ip_ids, &seller, &prices, &buyer, &2u32, &None);
 
         let swap_id = swap_ids.get(0).unwrap();
 
         client.approve_swap(&swap_id, &approver);
-        
+
         // Second approval from same approver should fail
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             client.approve_swap(&swap_id, &approver);
         }));
-        
+
         assert!(result.is_err());
     }
 
@@ -182,9 +184,8 @@ mod batch_approval_tests {
         let mut prices = Vec::new(&env);
         prices.push_back(1000i128);
 
-        let swap_ids = client.batch_initiate_swap(
-            &token_id, &ip_ids, &seller, &prices, &buyer, &1u32, &None,
-        );
+        let swap_ids =
+            client.batch_initiate_swap(&token_id, &ip_ids, &seller, &prices, &buyer, &1u32, &None);
 
         let swap_id = swap_ids.get(0).unwrap();
 
@@ -197,7 +198,7 @@ mod batch_approval_tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             client.approve_swap(&swap_id, &approver);
         }));
-        
+
         assert!(result.is_err());
     }
 
@@ -230,9 +231,8 @@ mod batch_approval_tests {
         prices.push_back(2000i128);
         prices.push_back(3000i128);
 
-        let swap_ids = client.batch_initiate_swap(
-            &token_id, &ip_ids, &seller, &prices, &buyer, &1u32, &None,
-        );
+        let swap_ids =
+            client.batch_initiate_swap(&token_id, &ip_ids, &seller, &prices, &buyer, &1u32, &None);
 
         // Approve each swap
         for i in 0..swap_ids.len() {
@@ -272,9 +272,8 @@ mod batch_approval_tests {
         let mut prices = Vec::new(&env);
         prices.push_back(1000i128);
 
-        let swap_ids = client.batch_initiate_swap(
-            &token_id, &ip_ids, &seller, &prices, &buyer, &1u32, &None,
-        );
+        let swap_ids =
+            client.batch_initiate_swap(&token_id, &ip_ids, &seller, &prices, &buyer, &1u32, &None);
 
         let swap_id = swap_ids.get(0).unwrap();
 
@@ -320,9 +319,8 @@ mod batch_approval_tests {
         let mut prices = Vec::new(&env);
         prices.push_back(1000i128);
 
-        let swap_ids = client.batch_initiate_swap(
-            &token_id, &ip_ids, &seller, &prices, &buyer, &1u32, &None,
-        );
+        let swap_ids =
+            client.batch_initiate_swap(&token_id, &ip_ids, &seller, &prices, &buyer, &1u32, &None);
 
         let swap_id = swap_ids.get(0).unwrap();
 

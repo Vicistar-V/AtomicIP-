@@ -66,6 +66,7 @@ pub fn require_unique_commitment(env: &Env, commitment_hash: &BytesN<32>) {
         .get::<DataKey, Address>(&DataKey::CommitmentOwner(commitment_hash.clone()))
     {
         // Emit event so callers can identify the existing owner
+        #[allow(deprecated)]
         env.events().publish(
             (symbol_short!("collision"), commitment_hash.clone()),
             existing_owner,

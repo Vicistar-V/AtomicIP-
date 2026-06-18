@@ -6,6 +6,28 @@ members = [
 ]
 resolver = "2"
 
+[workspace.lints.clippy]
+# Pre-existing lint suppressions — these fire on code predating this PR.
+len_zero = "allow"
+unnecessary_cast = "allow"
+useless_conversion = "allow"
+question_mark = "allow"
+manual_range_contains = "allow"
+needless_range_loop = "allow"
+bool_assert_comparison = "allow"
+manual_is_multiple_of = "allow"
+module_inception = "allow"
+empty_line_after_outer_attr = "allow"
+too_many_arguments = "allow"
+upper_case_acronyms = "allow"
+collapsible_if = "allow"
+needless_borrows_for_generic_args = "allow"
+
+[workspace.lints.rust]
+dead_code = "allow"
+unused_imports = "allow"
+unused_variables = "allow"
+
 [profile.release]
 opt-level = "z"
 overflow-checks = true

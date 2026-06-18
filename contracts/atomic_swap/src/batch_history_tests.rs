@@ -2,12 +2,10 @@
 mod batch_history_tests {
     use ip_registry::{IpRegistry, IpRegistryClient};
     use soroban_sdk::{
-        testutils::Address as _,
-        token::StellarAssetClient,
-        Address, Bytes, BytesN, Env, Vec,
+        testutils::Address as _, token::StellarAssetClient, Address, Bytes, BytesN, Env, Vec,
     };
 
-    use crate::{AtomicSwap, AtomicSwapClient, SwapStatus, SwapHistoryEntry};
+    use crate::{AtomicSwap, AtomicSwapClient, SwapHistoryEntry, SwapStatus};
 
     fn setup_registry(env: &Env, owner: &Address) -> Address {
         let registry_id = env.register(IpRegistry, ());
@@ -15,7 +13,12 @@ mod batch_history_tests {
         registry_id
     }
 
-    fn commit_ip(env: &Env, registry_id: &Address, owner: &Address, seed: u8) -> (u64, BytesN<32>, BytesN<32>) {
+    fn commit_ip(
+        env: &Env,
+        registry_id: &Address,
+        owner: &Address,
+        seed: u8,
+    ) -> (u64, BytesN<32>, BytesN<32>) {
         let registry = IpRegistryClient::new(env, registry_id);
         let secret = BytesN::from_array(env, &[seed; 32]);
         let blinding = BytesN::from_array(env, &[seed.wrapping_add(0x80); 32]);
@@ -28,7 +31,9 @@ mod batch_history_tests {
     }
 
     fn setup_token(env: &Env, admin: &Address, recipient: &Address, amount: i128) -> Address {
-        let token_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
         StellarAssetClient::new(env, &token_id).mint(recipient, &amount);
         token_id
     }
@@ -63,16 +68,15 @@ mod batch_history_tests {
         let mut prices = Vec::new(&env);
         prices.push_back(1000i128);
 
-        let swap_ids = client.batch_initiate_swap(
-            &token_id, &ip_ids, &seller, &prices, &buyer, &0u32, &None,
-        );
+        let swap_ids =
+            client.batch_initiate_swap(&token_id, &ip_ids, &seller, &prices, &buyer, &0u32, &None);
 
         let swap_id = swap_ids.get(0).unwrap();
         let history = client.get_swap_history(&swap_id);
 
         // Should have at least 1 entry for Pending status
         assert!(history.len() > 0);
-        
+
         let first_entry = history.get(0).unwrap();
         assert_eq!(first_entry.status, SwapStatus::Pending);
     }
@@ -99,9 +103,8 @@ mod batch_history_tests {
         let mut prices = Vec::new(&env);
         prices.push_back(1000i128);
 
-        let swap_ids = client.batch_initiate_swap(
-            &token_id, &ip_ids, &seller, &prices, &buyer, &0u32, &None,
-        );
+        let swap_ids =
+            client.batch_initiate_swap(&token_id, &ip_ids, &seller, &prices, &buyer, &0u32, &None);
 
         let swap_id = swap_ids.get(0).unwrap();
         let initial_len = client.get_swap_history(&swap_id).len();
@@ -140,9 +143,8 @@ mod batch_history_tests {
         let mut prices = Vec::new(&env);
         prices.push_back(1000i128);
 
-        let swap_ids = client.batch_initiate_swap(
-            &token_id, &ip_ids, &seller, &prices, &buyer, &0u32, &None,
-        );
+        let swap_ids =
+            client.batch_initiate_swap(&token_id, &ip_ids, &seller, &prices, &buyer, &0u32, &None);
 
         let swap_id = swap_ids.get(0).unwrap();
 
@@ -159,7 +161,7 @@ mod batch_history_tests {
         client.batch_reveal_keys(&ids, &secrets, &blindings, &seller);
 
         let history = client.get_swap_history(&swap_id);
-        
+
         // Should contain Pending -> Accepted -> Completed transitions
         assert!(history.len() >= 3);
 
@@ -193,9 +195,8 @@ mod batch_history_tests {
         prices.push_back(1000i128);
         prices.push_back(2000i128);
 
-        let swap_ids = client.batch_initiate_swap(
-            &token_id, &ip_ids, &seller, &prices, &buyer, &0u32, &None,
-        );
+        let swap_ids =
+            client.batch_initiate_swap(&token_id, &ip_ids, &seller, &prices, &buyer, &0u32, &None);
 
         // Verify both swaps have independent history records
         for i in 0..swap_ids.len() {
@@ -228,9 +229,8 @@ mod batch_history_tests {
         let mut prices = Vec::new(&env);
         prices.push_back(1000i128);
 
-        let swap_ids = client.batch_initiate_swap(
-            &token_id, &ip_ids, &seller, &prices, &buyer, &0u32, &None,
-        );
+        let swap_ids =
+            client.batch_initiate_swap(&token_id, &ip_ids, &seller, &prices, &buyer, &0u32, &None);
 
         let swap_id = swap_ids.get(0).unwrap();
         let initial_len = client.get_swap_history(&swap_id).len();
@@ -267,9 +267,8 @@ mod batch_history_tests {
         let mut prices = Vec::new(&env);
         prices.push_back(1000i128);
 
-        let swap_ids = client.batch_initiate_swap(
-            &token_id, &ip_ids, &seller, &prices, &buyer, &0u32, &None,
-        );
+        let swap_ids =
+            client.batch_initiate_swap(&token_id, &ip_ids, &seller, &prices, &buyer, &0u32, &None);
 
         let swap_id = swap_ids.get(0).unwrap();
 
@@ -311,9 +310,8 @@ mod batch_history_tests {
         let mut prices = Vec::new(&env);
         prices.push_back(1000i128);
 
-        let swap_ids = client.batch_initiate_swap(
-            &token_id, &ip_ids, &seller, &prices, &buyer, &0u32, &None,
-        );
+        let swap_ids =
+            client.batch_initiate_swap(&token_id, &ip_ids, &seller, &prices, &buyer, &0u32, &None);
 
         let swap_id = swap_ids.get(0).unwrap();
 
@@ -327,10 +325,7 @@ mod batch_history_tests {
         client.batch_accept_swaps(&ids, &buyer);
 
         let history_after_accept = client.get_swap_history(&swap_id);
-        assert_eq!(
-            history_after_accept.len(),
-            history_after_init.len() + 1
-        );
+        assert_eq!(history_after_accept.len(), history_after_init.len() + 1);
 
         // Step 3: Reveal (Completed)
         let mut secrets = Vec::new(&env);
@@ -342,13 +337,12 @@ mod batch_history_tests {
         client.batch_reveal_keys(&ids, &secrets, &blindings, &seller);
 
         let history_after_reveal = client.get_swap_history(&swap_id);
-        assert_eq!(
-            history_after_reveal.len(),
-            history_after_accept.len() + 1
-        );
+        assert_eq!(history_after_reveal.len(), history_after_accept.len() + 1);
 
         // Verify final state
-        let last_entry = history_after_reveal.get(history_after_reveal.len() - 1).unwrap();
+        let last_entry = history_after_reveal
+            .get(history_after_reveal.len() - 1)
+            .unwrap();
         assert_eq!(last_entry.status, SwapStatus::Completed);
     }
 
@@ -377,9 +371,8 @@ mod batch_history_tests {
         prices.push_back(1000i128);
         prices.push_back(2000i128);
 
-        let swap_ids = client.batch_initiate_swap(
-            &token_id, &ip_ids, &seller, &prices, &buyer, &0u32, &None,
-        );
+        let swap_ids =
+            client.batch_initiate_swap(&token_id, &ip_ids, &seller, &prices, &buyer, &0u32, &None);
 
         let swap_id_1 = swap_ids.get(0).unwrap();
         let swap_id_2 = swap_ids.get(1).unwrap();
@@ -421,7 +414,7 @@ mod batch_history_tests {
 
         // Query history for non-existent swap
         let history = client.get_swap_history(&999u64);
-        
+
         // Should return empty vector
         assert_eq!(history.len(), 0);
     }
