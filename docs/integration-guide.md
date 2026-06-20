@@ -263,3 +263,155 @@ def accept_swap(swap_address: str, buyer_keypair: Keypair, swap_id: int) -> str:
 
 - GitHub Issues: https://github.com/AtomicIP/AtomicIP-/issues
 - Documentation: https://github.com/AtomicIP/AtomicIP-/tree/main/docs
+
+---
+
+## Observability — Distributed Tracing Setup
+
+Atomic Patent API ships with OpenTelemetry (OTel) instrumentation that exports
+spans via the OTLP protocol. Any OTLP-compatible backend works out of the box:
+Jaeger, Datadog Agent, Grafana Tempo, Honeycomb, OpenTelemetry Collector, etc.
+
+### Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4317` | gRPC OTLP endpoint of your backend or Collector |
+| `OTEL_SERVICE_NAME` | `atomic-patent-api` | Service name that appears in trace UIs |
+| `OTEL_ENABLED` | `true` | Set to `false` to disable OTel and use plain JSON logs only |
+| `RUST_LOG` | `info` | Log level for the `tracing` subscriber (e.g. `debug`, `info,api_server=debug`) |
+
+### Quick Start — Jaeger (all-in-one)
+
+```bash
+# 1. Start Jaeger with OTLP gRPC enabled
+docker run -d --name jaeger \
+  -p 16686:16686 \
+  -p 4317:4317 \
+  jaegertracing/all-in-one:latest \
+  --collector.otlp.enabled=true
+
+# 2. Run the API server — it will auto-discover the local Jaeger instance
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
+OTEL_SERVICE_NAME=atomic-patent-api \
+cargo run -p api-server
+
+# 3. Open the Jaeger UI
+open http://localhost:16686
+```
+
+### Quick Start — Datadog Agent
+
+```bash
+# 1. Start the Datadog Agent with OTLP intake enabled
+docker run -d --name dd-agent \
+  -e DD_API_KEY=<YOUR_DD_API_KEY> \
+  -e DD_OTLP_CONFIG_RECEIVER_PROTOCOLS_GRPC_ENDPOINT=0.0.0.0:4317 \
+  -p 4317:4317 \
+  gcr.io/datadoghq/agent:latest
+
+# 2. Run the API server
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
+OTEL_SERVICE_NAME=atomic-patent-api \
+cargo run -p api-server
+```
+
+### Quick Start — OpenTelemetry Collector (recommended for production)
+
+```yaml
+# otel-collector-config.yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+exporters:
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+  datadog:
+    api:
+      key: ${DD_API_KEY}
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [otlp/jaeger, datadog]   # fan-out to multiple backends
+```
+
+```bash
+docker run --rm -v $(pwd)/otel-collector-config.yaml:/etc/otel/config.yaml \
+  -p 4317:4317 \
+  otel/opentelemetry-collector-contrib:latest \
+  --config /etc/otel/config.yaml
+```
+
+### Span Hierarchy
+
+Every HTTP request creates a root server span. Contract operations appear as
+child spans with domain-specific attributes:
+
+```
+HTTP POST /ip/commit               ← root span (HTTP semantic conventions)
+└── ip.commit_ip                   ← child span
+      ip.owner      = "GABCD..."
+      ip.commitment_hash = "deadbeef..."
+
+HTTP POST /swap/initiate
+└── swap.initiate
+      swap.ip_id  = 42
+      swap.seller = "GABCD..."
+      swap.buyer  = "GXYZ..."
+
+HTTP POST /batch
+└── batch.commit
+      batch.size = 10
+
+└── batch.escrow
+      batch.ip_count = 5
+```
+
+### Correlation ID Headers
+
+The API propagates trace correlation via standard headers. Include these in
+outbound calls and inspect them in responses for end-to-end tracing.
+
+| Header | Direction | Description |
+|---|---|---|
+| `traceparent` | request + response | W3C Trace Context (trace-id + span-id). Used by OTel SDK for distributed context propagation. |
+| `X-Trace-ID` | request + response | Human-readable trace UUID. Use this to search in Jaeger / Datadog. |
+| `X-Span-ID` | request + response | Current span UUID. Pass as `X-Span-ID` on the *next* outbound call to link parent → child spans. |
+
+**Example — propagating trace context between services:**
+
+```typescript
+// Service A calls Service B, forwarding the trace context.
+const response = await fetch('https://api.atomicpatent.io/ip/commit', {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+    // Forward context from the upstream request received by Service A:
+    'traceparent': upstreamRequest.headers.get('traceparent') ?? '',
+    'X-Trace-ID':  upstreamRequest.headers.get('X-Trace-ID') ?? '',
+    // Service A's current span becomes the parent for Service B's span:
+    'X-Span-ID':   serviceACurrentSpanId,
+  },
+  body: JSON.stringify({ owner, commitment_hash }),
+});
+
+// The trace_id in Service B's response will match Service A's trace_id.
+const traceId = response.headers.get('X-Trace-ID');
+```
+
+### Disabling Tracing
+
+```bash
+OTEL_ENABLED=false cargo run -p api-server
+```
+
+When disabled, the server falls back to structured JSON logs via
+`tracing-subscriber` without any OTLP export. All `tracing::info!/warn!/error!`
+calls still work normally.

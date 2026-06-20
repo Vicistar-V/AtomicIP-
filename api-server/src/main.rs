@@ -30,6 +30,7 @@ mod compression;
 mod fallback;
 mod distributed_tracing;
 mod error_recovery;
+mod otel;
 mod request_queue;
 
 #[derive(OpenApi)]
@@ -131,6 +132,10 @@ async fn require_json_content_type(req: Request<Body>, next: Next) -> Result<Res
 
 #[tokio::main]
 async fn main() {
+    // Initialise OpenTelemetry SDK (OTLP exporter) + tracing subscriber.
+    // Keep the provider alive until shutdown so spans are flushed on exit.
+    let tracer_provider = otel::init_tracer();
+
     metrics::init();
 
     let subscription_broadcaster = Arc::new(graphql::SubscriptionBroadcaster::new());
@@ -164,6 +169,7 @@ async fn main() {
         .route("/swap/{swap_id}", get(handlers::get_swap))
         .with_state((schema, broadcaster.clone(), health_checker.clone()))
         .layer(middleware::from_fn(metrics::track))
+        .layer(middleware::from_fn(distributed_tracing::distributed_tracing_middleware))
         .layer(middleware::from_fn(middleware_pipeline::cors_middleware));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
@@ -176,6 +182,11 @@ async fn main() {
     println!("Batch API    -> http://localhost:8080/batch");
     println!("GraphQL      -> http://localhost:8080/graphql");
     axum::serve(listener, app).await.unwrap();
+
+    // Flush and shut down the OTel tracer so all pending spans are exported.
+    if let Some(provider) = tracer_provider {
+        otel::shutdown_tracer(provider);
+    }
 }
 
 async fn ws_handler(

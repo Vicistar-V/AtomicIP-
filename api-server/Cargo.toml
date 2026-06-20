@@ -3,6 +3,11 @@ name = "api-server"
 version = "0.1.0"
 edition = "2021"
 
+# Stand-alone workspace declaration so this crate can be built independently
+# without being added to the root workspace (which has a separate Soroban
+# contract dependency graph).
+[workspace]
+
 [[bin]]
 name = "api-server"
 path = "src/main.rs"
@@ -17,6 +22,12 @@ utoipa = { version = "4", features = ["axum_extras"] }
 utoipa-swagger-ui = { version = "7", features = ["axum"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-opentelemetry = "0.25"
+opentelemetry = { version = "0.24", features = ["trace"] }
+opentelemetry_sdk = { version = "0.24", features = ["rt-tokio", "trace"] }
+opentelemetry-otlp = { version = "0.17", features = ["grpc-tonic", "trace"] }
+opentelemetry-semantic-conventions = "0.16"
+tonic = "0.12"
 metrics = "0.23"
 metrics-exporter-prometheus = "0.15"
 tower = "0.4"
@@ -27,8 +38,8 @@ dashmap = "5"
 tokio-tungstenite = "0.21"
 futures = "0.3"
 uuid = { version = "1", features = ["v4", "serde"] }
-async-graphql = "0.12"
-async-graphql-axum = "0.12"
+async-graphql = "7"
+async-graphql-axum = "7"
 sha2 = "0.10"
 hex = "0.4"
 async-trait = "0.1"
