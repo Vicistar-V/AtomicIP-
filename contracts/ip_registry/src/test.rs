@@ -1125,10 +1125,7 @@ mod tests {
         // entropy_score = (29 * 50) / 32 = 45
         // pow_score = (32 * 50) / 32 = 50
         // total = 95
-        let mut hash_bytes = [0u8; 32];
-        for i in 0..32 {
-            hash_bytes[i] = i as u8;
-        }
+        let mut hash_bytes: [u8; 32] = core::array::from_fn(|i| i as u8);
         hash_bytes[0] = 0;
         hash_bytes[1] = 0;
         hash_bytes[2] = 0;
@@ -1152,13 +1149,8 @@ mod tests {
         // entropy_score = (25 * 50) / 32 = 39
         // pow_score = 50
         // total = 89
-        let mut hash_bytes = [0u8; 32];
-        for i in 0..32 {
-            hash_bytes[i] = i as u8;
-        }
-        for i in 0..8 {
-            hash_bytes[i] = 0;
-        }
+        let mut hash_bytes: [u8; 32] = core::array::from_fn(|i| i as u8);
+        hash_bytes[..8].fill(0);
         let hash = BytesN::from_array(&env, &hash_bytes);
         let ip_id = client.commit_ip(&owner, &hash, &64u32);
         let strength = client.get_ip_strength(&ip_id);
@@ -1177,10 +1169,7 @@ mod tests {
         // entropy_score = (16 * 50) / 32 = 25
         // pow_score = (16 * 50) / 32 = 25
         // total = 50
-        let mut hash_bytes = [0u8; 32];
-        for i in 0..32 {
-            hash_bytes[i] = (i % 16) as u8;
-        }
+        let mut hash_bytes: [u8; 32] = core::array::from_fn(|i| (i % 16) as u8);
         hash_bytes[0] = 0;
         hash_bytes[1] = 0;
         let hash = BytesN::from_array(&env, &hash_bytes);
@@ -1358,7 +1347,7 @@ mod tests {
         let d = disputes.get(0).unwrap();
         assert_eq!(d.challenger, challenger);
         assert_eq!(d.reason, reason);
-        assert_eq!(d.resolved, false);
+        assert!(!d.resolved);
     }
 
     #[test]

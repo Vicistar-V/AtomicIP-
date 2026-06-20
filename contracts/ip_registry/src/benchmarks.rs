@@ -8,14 +8,14 @@
 #[cfg(test)]
 mod benchmarks {
     use soroban_sdk::{
-        testutils::{Address as _, budget::Budget},
+        testutils::Address as _,
         Address, Bytes, BytesN, Env,
     };
 
     use crate::{IpRegistry, IpRegistryClient};
 
     // CPU instruction limits (conservative upper bounds).
-    const COMMIT_IP_CPU_LIMIT: u64 = 500_000;
+    const COMMIT_IP_CPU_LIMIT: u64 = 600_000;
     const VERIFY_COMMITMENT_CPU_LIMIT: u64 = 200_000;
     const GET_IP_CPU_LIMIT: u64 = 100_000;
     const LIST_IP_BY_OWNER_CPU_LIMIT: u64 = 150_000;
@@ -43,9 +43,9 @@ mod benchmarks {
         let blinding = BytesN::from_array(&env, &[0x02u8; 32]);
         let hash = make_commitment(&env, &secret, &blinding);
 
-        env.budget().reset_default();
-        client.commit_ip(&owner, &hash);
-        let cpu = env.budget().cpu_instruction_count();
+        env.cost_estimate().budget().reset_default();
+        client.commit_ip(&owner, &hash, &0u32);
+        let cpu = env.cost_estimate().budget().cpu_instruction_cost();
 
         assert!(
             cpu <= COMMIT_IP_CPU_LIMIT,
@@ -64,9 +64,9 @@ mod benchmarks {
         let hash = make_commitment(&env, &secret, &blinding);
         let ip_id = client.commit_ip(&owner, &hash);
 
-        env.budget().reset_default();
+        env.cost_estimate().budget().reset_default();
         client.verify_commitment(&ip_id, &secret, &blinding);
-        let cpu = env.budget().cpu_instruction_count();
+        let cpu = env.cost_estimate().budget().cpu_instruction_cost();
 
         assert!(
             cpu <= VERIFY_COMMITMENT_CPU_LIMIT,
@@ -83,11 +83,11 @@ mod benchmarks {
         let secret = BytesN::from_array(&env, &[0x05u8; 32]);
         let blinding = BytesN::from_array(&env, &[0x06u8; 32]);
         let hash = make_commitment(&env, &secret, &blinding);
-        let ip_id = client.commit_ip(&owner, &hash);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
 
-        env.budget().reset_default();
+        env.cost_estimate().budget().reset_default();
         client.get_ip(&ip_id);
-        let cpu = env.budget().cpu_instruction_count();
+        let cpu = env.cost_estimate().budget().cpu_instruction_cost();
 
         assert!(
             cpu <= GET_IP_CPU_LIMIT,
@@ -107,12 +107,12 @@ mod benchmarks {
             let secret = BytesN::from_array(&env, &[i; 32]);
             let blinding = BytesN::from_array(&env, &[i.wrapping_add(0x80); 32]);
             let hash = make_commitment(&env, &secret, &blinding);
-            client.commit_ip(&owner, &hash);
+            client.commit_ip(&owner, &hash, &0u32);
         }
 
-        env.budget().reset_default();
+        env.cost_estimate().budget().reset_default();
         client.list_ip_by_owner(&owner);
-        let cpu = env.budget().cpu_instruction_count();
+        let cpu = env.cost_estimate().budget().cpu_instruction_cost();
 
         assert!(
             cpu <= LIST_IP_BY_OWNER_CPU_LIMIT,

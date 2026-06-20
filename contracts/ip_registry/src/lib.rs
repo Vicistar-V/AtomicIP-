@@ -173,8 +173,6 @@ pub enum DataKey {
     BatchMetadata(u64),
     // Issue #457: Encrypted commitment
     EncryptedCommitment(u64),
-    // Issue #456: Compression algorithm selection
-    CompressionSelection(u64),
     // Issue #465: Batch escrow — keyed by escrow_id (sha256 of ip_ids + timestamp)
     BatchEscrow(BytesN<32>),
 }
@@ -1330,14 +1328,14 @@ impl IpRegistry {
         signers: soroban_sdk::Vec<Address>,
     ) {
         require_ip_exists(&env, ip_id);
-        if threshold == 0 || threshold > signers.len() as u32 {
+        if threshold == 0 || threshold > signers.len() {
             panic_with_error!(&env, ContractError::ThresholdNotMet);
         }
 
         let config = ThresholdConfig {
             ip_id,
             threshold,
-            total: signers.len() as u32,
+            total: signers.len(),
             signers: signers.clone(),
         };
 
@@ -1430,7 +1428,7 @@ impl IpRegistry {
             None => return false,
         };
         let signatures = Self::get_threshold_signatures(env.clone(), ip_id);
-        signatures.len() >= config.threshold as u32
+        signatures.len() >= config.threshold
     }
 
     // ── Issue #455: Batch Metadata ──────────────────────────────────────────
@@ -1494,7 +1492,7 @@ impl IpRegistry {
         let hash = record.commitment_hash;
 
         match algo {
-            CompressionAlgo::None => Bytes::from_array(&env, &hash.to_array()).into(),
+            CompressionAlgo::None => Bytes::from_array(&env, &hash.to_array()),
             CompressionAlgo::Truncate16 => {
                 let mut bytes = Bytes::new(&env);
                 let arr = hash.to_array();
@@ -2319,7 +2317,7 @@ impl IpRegistry {
             .get(&DataKey::OwnerIps(owner))
             .unwrap_or(Vec::new(&env));
 
-        if ip_ids.len() == 0 {
+        if ip_ids.is_empty() {
             return BytesN::from_array(&env, &[0u8; 32]);
         }
 
@@ -2422,7 +2420,7 @@ impl IpRegistry {
         let mut current_index = index;
 
         while current_level.len() > 1 {
-            let sibling_index = if current_index % 2 == 0 {
+            let sibling_index = if current_index.is_multiple_of(2) {
                 current_index + 1
             } else {
                 current_index - 1
@@ -2459,7 +2457,7 @@ impl IpRegistry {
     }
 
     fn merkle_root(env: &Env, hashes: &Vec<BytesN<32>>) -> BytesN<32> {
-        if hashes.len() == 0 {
+        if hashes.is_empty() {
             return BytesN::from_array(env, &[0u8; 32]);
         }
         if hashes.len() == 1 {
@@ -2535,7 +2533,7 @@ impl IpRegistry {
         let record = require_ip_exists(&env, ip_id);
         record.owner.require_auth();
 
-        if access_level < 1 || access_level > 3 {
+        if !(1..=3).contains(&access_level) {
             env.panic_with_error(Error::from_contract_error(
                 ContractError::Unauthorized as u32,
             ));
@@ -2826,11 +2824,8 @@ impl IpRegistry {
             .storage()
             .persistent()
             .get(&DataKey::CommitmentOwner(commitment_hash.clone()));
-        if owner.is_none() {
-            return None;
-        }
         // Walk the owner's IP list to find the matching record
-        let owner_addr = owner.unwrap();
+        let owner_addr = owner?;
         let ids: Vec<u64> = env
             .storage()
             .persistent()
@@ -4200,7 +4195,7 @@ impl IpRegistry {
     ///
     /// Panics with `IpNotFound` if any `ip_id` does not exist.
     pub fn batch_verify_commitments(env: Env, requests: Vec<VerifyRequest>) -> Vec<VerifyResult> {
-        let total_count = requests.len() as u32;
+        let total_count = requests.len();
         let mut results = Vec::new(&env);
         let mut valid_hashes: Vec<BytesN<32>> = Vec::new(&env);
 
@@ -4223,7 +4218,7 @@ impl IpRegistry {
             }
         }
 
-        let valid_count = valid_hashes.len() as u32;
+        let valid_count = valid_hashes.len();
         let aggregate_proof = aggregate_batch_proof(&env, &valid_hashes);
 
         let stored = BatchVerifyResultStorage {
@@ -4287,7 +4282,7 @@ impl IpRegistry {
     pub fn verify_batch_proof(
         env: Env,
         proof_hash: BytesN<32>,
-    ) -> Option<BatchVerifyProof> {
+    ) -> Option<BatchVerifyResultStorage> {
         env.storage()
             .persistent()
             .get(&DataKey::BatchVerifyResult(proof_hash))
@@ -4312,7 +4307,7 @@ impl IpRegistry {
         let category_hash: BytesN<32> = env.crypto().sha256(&path).into();
 
         let mut depth: u32 = 1;
-        if path.len() > 0 {
+        if !path.is_empty() {
             for byte in path.iter() {
                 if byte == b'/' {
                     depth += 1;

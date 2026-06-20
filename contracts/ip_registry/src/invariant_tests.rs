@@ -6,10 +6,12 @@
 /// Run with: cargo test invariant_ -p ip_registry
 #[cfg(test)]
 mod invariant_tests {
+    extern crate std;
+
     use proptest::prelude::*;
     use soroban_sdk::{
         testutils::Address as _,
-        Address, Bytes, BytesN, Env,
+        Address, Bytes, BytesN, Env, Vec,
     };
 
     use crate::{IpRegistry, IpRegistryClient};
@@ -80,18 +82,21 @@ mod invariant_tests {
         fn invariant_i2_id_monotonicity(n in 2usize..=10usize) {
             let (env, client) = setup();
             let owner = Address::generate(&env);
-            let mut ids = Vec::new();
+            let mut ids: Vec<u64> = Vec::new(&env);
 
             for i in 0..n {
                 let secret = BytesN::from_array(&env, &[i as u8 + 1; 32]);
                 let blinding = BytesN::from_array(&env, &[(i as u8).wrapping_add(0x80); 32]);
                 let hash = make_commitment(&env, &secret, &blinding);
-                ids.push(client.commit_ip(&owner, &hash, &0u32));
+                ids.push_back(client.commit_ip(&owner, &hash, &0u32));
             }
 
             // IDs must be strictly increasing.
-            for w in ids.windows(2) {
-                prop_assert!(w[1] > w[0], "IP IDs must be monotonically increasing");
+            for i in 0..ids.len() - 1 {
+                prop_assert!(
+                    ids.get(i + 1).unwrap() > ids.get(i).unwrap(),
+                    "IP IDs must be monotonically increasing"
+                );
             }
         }
     }
@@ -175,19 +180,20 @@ mod invariant_tests {
         fn invariant_i6_owner_list_consistency(n in 1usize..=5usize) {
             let (env, client) = setup();
             let owner = Address::generate(&env);
-            let mut committed_ids = Vec::new();
+            let mut committed_ids: Vec<u64> = Vec::new(&env);
 
             for i in 0..n {
                 let secret = BytesN::from_array(&env, &[i as u8 + 10; 32]);
                 let blinding = BytesN::from_array(&env, &[(i as u8).wrapping_add(0x40); 32]);
                 let hash = make_commitment(&env, &secret, &blinding);
-                committed_ids.push(client.commit_ip(&owner, &hash, &0u32));
+                committed_ids.push_back(client.commit_ip(&owner, &hash, &0u32));
             }
 
             let listed = client.list_ip_by_owner(&owner);
-            for id in &committed_ids {
+            for i in 0..committed_ids.len() {
+                let id = committed_ids.get(i).unwrap();
                 prop_assert!(
-                    listed.contains(id),
+                    listed.iter().any(|x| x == id),
                     "IP {} must appear in owner's list",
                     id
                 );
