@@ -259,6 +259,114 @@ def accept_swap(swap_address: str, buyer_keypair: Keypair, swap_id: int) -> str:
 - RPC URL: `https://soroban-testnet.stellar.org`
 - Contract addresses: See [README deployment status](#)
 
+## Circuit Breaker Configuration
+
+The API server wraps every external service call (Soroban RPC, databases, price oracles) in a
+circuit breaker that prevents cascading failures when a dependency becomes unavailable.
+
+### State Machine
+
+```
+           ┌─────────────────┐
+           │     CLOSED      │◄──────────────────────────────────────────┐
+           │  (normal flow)  │                                           │
+           └────────┬────────┘                                           │
+                    │ failure_threshold consecutive failures             │
+                    ▼                                                     │
+           ┌─────────────────┐   timeout_secs elapses   ┌───────────────┴──┐
+           │      OPEN       │─────────────────────────►│    HALF-OPEN     │
+           │ (rejects calls) │                           │  (test requests) │
+           └─────────────────┘◄──────────────────────── └──────────────────┘
+                                  any failure               success_threshold
+                                                          consecutive successes
+```
+
+| Transition | Trigger |
+|---|---|
+| Closed → Open | `failure_threshold` consecutive failures |
+| Open → HalfOpen | `timeout_secs` seconds elapse since last failure |
+| HalfOpen → Closed | `success_threshold` consecutive successes (recovery) |
+| HalfOpen → Open | Any failure during test requests |
+
+### Configuration Parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `failure_threshold` | `5` | Consecutive failures before opening the circuit |
+| `success_threshold` | `2` | Consecutive successes in HalfOpen state before closing |
+| `timeout_secs` | `30` | Seconds the circuit stays Open before allowing test requests |
+| `half_open_max_calls` | `3` | Maximum concurrent test requests allowed in HalfOpen state |
+
+### Emitted Metrics
+
+All metrics are exported in Prometheus format via `GET /metrics`.
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `circuit_breaker_state_transitions_total` | Counter | `service`, `from`, `to` | Incremented on every state change |
+| `circuit_breaker_state` | Gauge | `service` | Current state: `0`=closed, `1`=open, `2`=half_open |
+| `circuit_breaker_calls_total` | Counter | `service` | Total calls attempted through the breaker |
+| `circuit_breaker_calls_rejected_total` | Counter | `service`, `state` | Calls rejected because the circuit is open |
+
+### Named Circuit Breakers
+
+Each external service gets its own named circuit breaker so failures are isolated:
+
+```rust
+use api_server::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+
+let oracle_cb = CircuitBreaker::new(
+    "price-oracle",
+    CircuitBreakerConfig {
+        failure_threshold: 5,
+        success_threshold: 2,
+        timeout_secs: 30,
+        half_open_max_calls: 3,
+    },
+);
+
+let db_cb = CircuitBreaker::new(
+    "postgres",
+    CircuitBreakerConfig::default(), // same defaults
+);
+```
+
+### Using the `call` Helper
+
+The `call` method wraps a closure and automatically records success or failure:
+
+```rust
+use api_server::circuit_breaker::CallError;
+
+let result = oracle_cb.call(|| fetch_price_from_oracle());
+
+match result {
+    Ok(price) => { /* use price */ }
+    Err(CallError::CircuitOpen) => {
+        // Oracle circuit is open — return cached value or degrade gracefully
+    }
+    Err(CallError::ServiceError(e)) => {
+        // Oracle responded but returned an error
+    }
+}
+```
+
+### Alerting Recommendations
+
+Configure alerts on these Prometheus expressions:
+
+```promql
+# Circuit has been open for more than 60 seconds
+circuit_breaker_state{service="price-oracle"} == 1
+
+# Rejection rate exceeds 10% of all attempts
+rate(circuit_breaker_calls_rejected_total[1m])
+  / rate(circuit_breaker_calls_total[1m]) > 0.1
+
+# More than 3 state transitions per minute (thrashing)
+rate(circuit_breaker_state_transitions_total[1m]) > 3
+```
+
 ## Support
 
 - GitHub Issues: https://github.com/AtomicIP/AtomicIP-/issues

@@ -236,18 +236,13 @@ async fn events_handler(
 }
 
 fn build_app() -> Router {
-    let broadcaster = Arc::new(graphql::SubscriptionBroadcaster::new());
-    let schema = graphql::build_schema_with_broadcaster(
-        Arc::new(graphql::MockSorobanRpcClient::default()),
-        broadcaster,
-    );
-    let state = AppState {
-        schema,
-        ws_broadcaster:  Arc::new(websocket::EventBroadcaster::new()),
-        sse_broadcaster: Arc::new(events::create_event_broadcaster().0),
-        health_checker:  Arc::new(health::HealthChecker::new()),
-    };
-
+    let schema = graphql::build_schema();
+    let health_checker = Arc::new(health::HealthChecker::new());
+    let circuit_breaker = Arc::new(circuit_breaker::CircuitBreaker::new(
+        "default",
+        circuit_breaker::CircuitBreakerConfig::default(),
+    ));
+    
     Router::new()
         .route("/health", get(health::health_handler))
         .route("/version", get(versioning::get_version_info))
