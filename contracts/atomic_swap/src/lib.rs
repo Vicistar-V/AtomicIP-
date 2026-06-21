@@ -7,6 +7,9 @@ mod multi_currency;
 mod price_oracle;
 mod types;
 mod utils;
+pub mod cross_contract;
+#[cfg(test)]
+mod cross_contract_tests;
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Bytes,
