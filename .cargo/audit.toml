@@ -1,0 +1,14 @@
+[advisories]
+# RUSTSEC-2024-0436: `paste` crate is unmaintained (archived by dtolnay, 2024-10-07).
+#
+# `paste` is a TRANSITIVE dependency pulled in by soroban-env-host (via ark-ff)
+# and soroban-wasmi (via wasmi_core), both part of soroban-sdk = "26.0.1".
+# This project has no direct dependency on `paste` and cannot substitute it
+# without the upstream soroban-sdk migrating to an alternative (e.g. pastey).
+#
+# Risk: "unmaintained" classification only — no CVE, no known exploit, no
+# soundness issue. Advisory alternatives (pastey, with_builtin_macros) are
+# valid drop-in replacements but require upstream adoption.
+#
+# TODO: Remove this ignore once soroban-sdk drops its dependency on `paste`.
+ignore = ["RUSTSEC-2024-0436"]
