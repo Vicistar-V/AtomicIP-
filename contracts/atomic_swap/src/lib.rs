@@ -13,7 +13,7 @@ mod cross_contract_tests;
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Bytes,
-    BytesN, Env, Error, String, Vec,
+    BytesN, Env, Error, IntoVal, String, Val, Vec,
 };
 
 // pub use upgrade::{build_v1_schema, ContractSchema, ErrorEntry, FunctionEntry};
@@ -22,8 +22,9 @@ pub use types::*;
 mod validation;
 use multi_currency::{MultiCurrencyConfig, SupportedToken, TokenMetadata};
 use price_oracle::{
-    fetch_oracle_price, load_oracle_config, store_oracle_config, validate_price_bounds,
-    OracleConfig, OracleConfigSetEvent, OraclePriceUsedEvent,
+    fetch_oracle_price, fetch_oracle_price_with_staleness_check, load_oracle_config,
+    store_oracle_config, validate_price_bounds, OracleConfig, OracleConfigSetEvent,
+    OraclePriceUsedEvent, OracleStalePriceEvent, ORACLE_STALENESS_THRESHOLD_SECS,
 };
 use validation::*;
 
@@ -282,6 +283,7 @@ impl AtomicSwap {
 
     /// Admin sets (or updates) the price oracle contract address.
     /// Pass `enabled = false` to disable oracle-based pricing without removing the address.
+    /// When enabling, initializes with current timestamp and fetches initial cached price.
     pub fn set_oracle(env: Env, caller: Address, oracle_address: Address, enabled: bool) {
         caller.require_auth();
         let admin: Address = env
@@ -298,9 +300,39 @@ impl AtomicSwap {
                 ContractError::Unauthorized as u32,
             ));
         }
+
+        let (initial_timestamp, initial_price) = if enabled {
+            // Try to fetch initial price from the oracle
+            let mut args: soroban_sdk::Vec<Val> = soroban_sdk::Vec::new(&env);
+            args.push_back(oracle_address.clone().into_val(&env));
+            let price: i128 = env.invoke_contract(
+                &oracle_address,
+                &symbol_short!("get_price"),
+                args,
+            );
+
+            if price <= 0 {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::OraclePriceInvalid as u32,
+                ));
+            }
+
+            (env.ledger().timestamp(), price)
+        } else {
+            // When disabling, preserve existing timestamp/price or use defaults
+            let existing = load_oracle_config(&env);
+            if let Some(config) = existing {
+                (config.last_update_timestamp, config.cached_price)
+            } else {
+                (0, 0)
+            }
+        };
+
         let config = OracleConfig {
             oracle_address: oracle_address.clone(),
             enabled,
+            last_update_timestamp: initial_timestamp,
+            cached_price: initial_price,
         };
         store_oracle_config(&env, &config);
         env.events().publish(
@@ -318,13 +350,15 @@ impl AtomicSwap {
     }
 
     /// Fetches the current price for `token` from the configured oracle.
+    /// Returns fresh price if oracle was updated within 5 minutes, otherwise uses cached price.
     /// Useful for off-chain clients to preview the oracle price before initiating a swap.
     pub fn get_oracle_price(env: Env, token: Address) -> i128 {
-        fetch_oracle_price(&env, &token)
+        fetch_oracle_price_with_staleness_check(&env, &token)
     }
 
     /// Seller initiates a swap where the price is fetched from the oracle at call time.
     /// `min_price` / `max_price` are optional slippage guards (0 = no bound).
+    /// Uses staleness-aware price fetching: fresh oracle price if available, cached price otherwise.
     /// Returns the swap ID.
     pub fn initiate_swap_with_oracle_price(
         env: Env,
@@ -339,7 +373,7 @@ impl AtomicSwap {
         min_price: i128,
         max_price: i128,
     ) -> u64 {
-        let oracle_price = fetch_oracle_price(&env, &token);
+        let oracle_price = fetch_oracle_price_with_staleness_check(&env, &token);
         validate_price_bounds(&env, oracle_price, min_price, max_price);
 
         let swap_id = Self::initiate_swap(
