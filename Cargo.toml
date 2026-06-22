@@ -6,6 +6,10 @@ members = [
 ]
 resolver = "2"
 
+[workspace.dependencies]
+# Security: Force rand 0.8.6+ to avoid RUSTSEC-2026-0097 (unsound with custom logger)
+rand = "0.8.6"
+
 [workspace.lints.clippy]
 # Pre-existing lint suppressions — these fire on code predating this PR.
 len_zero = "allow"
