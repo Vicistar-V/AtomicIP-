@@ -152,4 +152,3 @@ async fn deliver(url: &str, payload: &WebhookPayload) -> Result<StatusCode, reqw
         .await?;
     Ok(response.status())
 }
-

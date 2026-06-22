@@ -1095,3 +1095,65 @@ A request-level middleware enforces validation before handlers execute:
 ```
 
 All validation failures are logged for monitoring and audit purposes.
+
+---
+
+## Rate limiting
+
+The HTTP API uses token buckets to allow short bursts while recovering quota
+continuously. Every request must have capacity in the global and source-IP
+buckets. Authenticated requests must also have capacity in the bucket for the
+JWT `sub` claim or API key. Exceeding any one of these quotas returns `429 Too Many
+Requests`; rejected requests do not consume capacity from the other buckets.
+
+### Default policy
+
+| Scope or tier | Sustained rate | Burst capacity |
+|---|---:|---:|
+| Global (all clients) | 20,000 requests/minute | 2,000 |
+| Source IP | 300 requests/minute | 100 |
+| Free user | 60 requests/minute | 30 |
+| Premium user | 600 requests/minute | 200 |
+| Enterprise user | 6,000 requests/minute | 1,000 |
+
+Unknown authenticated users receive the free tier. Premium and enterprise
+assignments are made by trusted server-side billing/authentication code through
+`RateLimitMiddleware::set_user_tier`; a request cannot select its own tier.
+Operators can replace every quota through `RateLimitConfig` at startup.
+
+Repeated violations apply exponential backoff beginning at one second and
+capped at 60 seconds. A successful request clears the client's violation
+streak. Idle client state expires after 15 minutes, and tracked IP/user counts
+are bounded to prevent a distributed attack from exhausting limiter memory.
+
+### Response headers
+
+All HTTP responses include:
+
+| Header | Meaning |
+|---|---|
+| `X-RateLimit-Limit` | Burst capacity of the currently most constrained bucket |
+| `X-RateLimit-Remaining` | Whole tokens remaining after this request |
+| `X-RateLimit-Reset` | Unix timestamp when that bucket is full again |
+| `X-RateLimit-Scope` | Constraining scope: `global`, `ip`, or `user` |
+| `X-RateLimit-Tier` | Effective user tier (`free` for unauthenticated traffic) |
+
+A `429` response also includes `Retry-After`, in seconds, and a JSON body:
+
+```json
+{
+  "error": "rate_limit_exceeded",
+  "scope": "user",
+  "retry_after_seconds": 2
+}
+```
+
+Clients should wait for `Retry-After` and add jitter before retrying. Requests
+sent during a backoff window continue to receive `429`.
+
+### Proxy deployment
+
+The TCP peer address is used by default, and `X-Forwarded-For` is ignored to
+prevent clients from evading IP limits by spoofing headers. Set
+`RateLimitConfig::trust_proxy_headers` only when the API is reachable solely
+through a trusted reverse proxy that replaces `X-Forwarded-For`.

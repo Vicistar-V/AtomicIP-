@@ -135,7 +135,13 @@ pub async fn cors_middleware(
     );
     response.headers_mut().insert(
         "Access-Control-Allow-Headers",
-        "Content-Type, Authorization, X-Signature, X-Timestamp, X-Public-Key"
+        "Content-Type, Authorization, X-Signature, X-Timestamp, X-Public-Key, X-API-Key"
+            .parse()
+            .unwrap(),
+    );
+    response.headers_mut().insert(
+        "Access-Control-Expose-Headers",
+        "X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset, X-RateLimit-Scope, X-RateLimit-Tier, Retry-After"
             .parse()
             .unwrap(),
     );

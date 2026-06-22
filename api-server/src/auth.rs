@@ -195,4 +195,3 @@ impl Clone for AuthExtension {
         AuthExtension(self.0.clone())
     }
 }
-

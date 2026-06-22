@@ -47,6 +47,7 @@ mod distributed_tracing;
 mod error_recovery;
 mod otel;
 mod request_queue;
+mod rate_limit;
 mod validation;
 mod validation_middleware;
 #[cfg(test)]
@@ -165,6 +166,7 @@ async fn main() {
         health_checker:  Arc::new(health::HealthChecker::new()),
     };
 
+    let rate_limiter = rate_limit::RateLimitMiddleware::new(rate_limit::RateLimitConfig::default());
     let app = Router::new()
         .route("/health",          get(health::health_handler))
         .route("/health/detailed", get(health::detailed_health_handler))
@@ -188,6 +190,7 @@ async fn main() {
         .route("/swap/{swap_id}",                 get(handlers::get_swap))
         .route("/openapi.json", get(openapi_handler))
         .with_state(state)
+        .layer(middleware::from_fn_with_state(rate_limiter, rate_limit::rate_limit_middleware))
         .layer(middleware::from_fn(metrics::track))
         .layer(middleware::from_fn(distributed_tracing::distributed_tracing_middleware))
         .layer(middleware::from_fn(middleware_pipeline::cors_middleware));
@@ -201,7 +204,7 @@ async fn main() {
     println!("Events SSE      -> http://localhost:8080/events");
     println!("Batch API       -> http://localhost:8080/batch");
     println!("GraphQL         -> http://localhost:8080/graphql");
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
 
     // Flush and shut down the OTel tracer so all pending spans are exported.
     if let Some(provider) = tracer_provider {
@@ -247,6 +250,7 @@ fn build_app() -> Router {
         circuit_breaker::CircuitBreakerConfig::default(),
     ));
     
+    let rate_limiter = rate_limit::RateLimitMiddleware::new(rate_limit::RateLimitConfig::default());
     Router::new()
         .route("/health", get(health::health_handler))
         .route("/version", get(versioning::get_version_info))
@@ -266,6 +270,7 @@ fn build_app() -> Router {
         .route("/v1/bulk/commit-ip", post(handlers::bulk_commit_ip))
         .route("/v1/bulk/initiate-swap", post(handlers::bulk_initiate_swap))
         .with_state(state)
+        .layer(middleware::from_fn_with_state(rate_limiter, rate_limit::rate_limit_middleware))
         .layer(middleware::from_fn(tracing_middleware::trace_requests))
         .layer(middleware::from_fn(versioning::version_negotiation))
         .layer(middleware::from_fn(compression::compression_middleware))

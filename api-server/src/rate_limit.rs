@@ -1,76 +1,580 @@
-use std::sync::Arc;
-use std::net::SocketAddr;
+//! Concurrent token-bucket rate limiting for HTTP requests.
+//!
+//! Limits are enforced atomically across global, source-IP, and authenticated
+//! user scopes. A single lock deliberately covers the check-and-consume step:
+//! a request can never consume one quota and then fail another quota.
+
+use crate::auth::AuthExtension;
 use axum::{
-    extract::{ConnectInfo, Request},
-    http::StatusCode,
+    extract::{ConnectInfo, Request, State},
+    http::{HeaderName, HeaderValue, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
+    Json,
 };
-use dashmap::DashMap;
-use governor::{
-    clock::DefaultClock,
-    state::{InMemoryState, NotKeyed},
-    Quota, RateLimiter,
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use once_cell::sync::Lazy;
 
-/// Per-IP rate limit: 100 requests per minute.
-static IP_LIMITERS: Lazy<DashMap<String, Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>>> =
-    Lazy::new(DashMap::new);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RateLimitTier {
+    Free,
+    Premium,
+    Enterprise,
+}
 
-/// Per-API-key rate limit: 1000 requests per minute.
-static KEY_LIMITERS: Lazy<DashMap<String, Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>>> =
-    Lazy::new(DashMap::new);
-
-/// Custom rate-limit-exceeded response.
-#[derive(Debug)]
-pub struct RateLimitExceeded;
-
-impl IntoResponse for RateLimitExceeded {
-    fn into_response(self) -> Response {
-        let body = serde_json::json!({ "error": "Rate limit exceeded" });
-        (StatusCode::TOO_MANY_REQUESTS, axum::Json(body)).into_response()
+impl RateLimitTier {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Free => "free",
+            Self::Premium => "premium",
+            Self::Enterprise => "enterprise",
+        }
     }
 }
 
-/// Axum middleware that enforces token-bucket rate limits.
-/// Checks per-API-key first (if `x-api-key` header present), then falls back to per-IP.
-pub async fn layer(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+/// A bucket's sustained refill rate and maximum burst capacity.
+#[derive(Debug, Clone, Copy)]
+pub struct BucketQuota {
+    pub requests_per_minute: u32,
+    pub burst: u32,
+}
+
+impl BucketQuota {
+    pub const fn new(requests_per_minute: u32, burst: u32) -> Self {
+        Self {
+            requests_per_minute,
+            burst,
+        }
+    }
+
+    fn refill_per_second(self) -> f64 {
+        self.requests_per_minute as f64 / 60.0
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RateLimitConfig {
+    pub global: BucketQuota,
+    pub per_ip: BucketQuota,
+    pub free: BucketQuota,
+    pub premium: BucketQuota,
+    pub enterprise: BucketQuota,
+    /// Honor forwarding headers only when the immediate peer is a trusted proxy.
+    pub trust_proxy_headers: bool,
+    pub base_backoff: Duration,
+    pub max_backoff: Duration,
+    /// Bounds attacker-controlled cardinality. New identities share overflow buckets.
+    pub max_tracked_ips: usize,
+    pub max_tracked_users: usize,
+    pub idle_ttl: Duration,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            global: BucketQuota::new(20_000, 2_000),
+            per_ip: BucketQuota::new(300, 100),
+            free: BucketQuota::new(60, 30),
+            premium: BucketQuota::new(600, 200),
+            enterprise: BucketQuota::new(6_000, 1_000),
+            trust_proxy_headers: false,
+            base_backoff: Duration::from_secs(1),
+            max_backoff: Duration::from_secs(60),
+            max_tracked_ips: 100_000,
+            max_tracked_users: 100_000,
+            idle_ttl: Duration::from_secs(15 * 60),
+        }
+    }
+}
+
+impl RateLimitConfig {
+    fn quota_for(&self, tier: RateLimitTier) -> BucketQuota {
+        match tier {
+            RateLimitTier::Free => self.free,
+            RateLimitTier::Premium => self.premium,
+            RateLimitTier::Enterprise => self.enterprise,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Bucket {
+    tokens: f64,
+    updated_at: Instant,
+    last_seen: Instant,
+}
+
+impl Bucket {
+    fn full(quota: BucketQuota, now: Instant) -> Self {
+        Self {
+            tokens: quota.burst as f64,
+            updated_at: now,
+            last_seen: now,
+        }
+    }
+
+    fn refill(&mut self, quota: BucketQuota, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.updated_at).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * quota.refill_per_second()).min(quota.burst as f64);
+        self.updated_at = now;
+        self.last_seen = now;
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct Violation {
+    count: u32,
+    blocked_until: Option<Instant>,
+    last_seen: Option<Instant>,
+    scope: &'static str,
+    limit: u32,
+}
+
+#[derive(Debug)]
+struct Store {
+    global: Bucket,
+    ips: HashMap<String, Bucket>,
+    users: HashMap<String, Bucket>,
+    violations: HashMap<String, Violation>,
+    user_tiers: HashMap<String, RateLimitTier>,
+    checks: u64,
+}
+
+/// Cloneable middleware state. Instances are application-owned, making tests and
+/// multiple server instances independent.
+#[derive(Debug, Clone)]
+pub struct RateLimitMiddleware {
+    config: Arc<RateLimitConfig>,
+    store: Arc<Mutex<Store>>,
+}
+
+#[derive(Debug)]
+struct Decision {
+    allowed: bool,
+    limit: u32,
+    remaining: u32,
+    reset_after: Duration,
+    retry_after: Duration,
+    scope: &'static str,
+    tier: RateLimitTier,
+}
+
+impl RateLimitMiddleware {
+    pub fn new(config: RateLimitConfig) -> Self {
+        for quota in [
+            config.global,
+            config.per_ip,
+            config.free,
+            config.premium,
+            config.enterprise,
+        ] {
+            assert!(
+                quota.requests_per_minute > 0,
+                "rate-limit refill rate must be positive"
+            );
+            assert!(quota.burst > 0, "rate-limit burst must be positive");
+        }
+        let now = Instant::now();
+        let global = Bucket::full(config.global, now);
+        Self {
+            config: Arc::new(config),
+            store: Arc::new(Mutex::new(Store {
+                global,
+                ips: HashMap::new(),
+                users: HashMap::new(),
+                violations: HashMap::new(),
+                user_tiers: HashMap::new(),
+                checks: 0,
+            })),
+        }
+    }
+
+    /// Assign a verified user to a billing tier. Unknown users use the free tier.
+    pub fn set_user_tier(&self, user_id: impl Into<String>, tier: RateLimitTier) {
+        self.store
+            .lock()
+            .unwrap()
+            .user_tiers
+            .insert(user_id.into(), tier);
+    }
+
+    fn check(&self, ip: &str, user: Option<&str>, now: Instant) -> Decision {
+        let mut store = self.store.lock().unwrap();
+        store.checks += 1;
+        if store.checks % 1024 == 0 {
+            let ttl = self.config.idle_ttl;
+            store
+                .ips
+                .retain(|_, b| now.saturating_duration_since(b.last_seen) < ttl);
+            store
+                .users
+                .retain(|_, b| now.saturating_duration_since(b.last_seen) < ttl);
+            store.violations.retain(|_, v| {
+                v.last_seen
+                    .map(|t| now.saturating_duration_since(t) < ttl)
+                    .unwrap_or(false)
+            });
+        }
+
+        let tier = user
+            .and_then(|u| store.user_tiers.get(u).copied())
+            .unwrap_or(RateLimitTier::Free);
+        let user_quota = self.config.quota_for(tier);
+
+        // Cardinality overflow keys ensure unknown identities remain limited without
+        // allowing unbounded memory allocation during a distributed attack.
+        let ip_key = if store.ips.contains_key(ip) || store.ips.len() < self.config.max_tracked_ips
+        {
+            ip.to_owned()
+        } else {
+            "__overflow__".to_owned()
+        };
+        let user_key = user.map(|u| {
+            if store.users.contains_key(u) || store.users.len() < self.config.max_tracked_users {
+                u.to_owned()
+            } else {
+                "__overflow__".to_owned()
+            }
+        });
+        let violation_key = user_key
+            .as_ref()
+            .map(|u| format!("user:{u}"))
+            .unwrap_or_else(|| format!("ip:{ip_key}"));
+
+        if let Some(until) = store
+            .violations
+            .get(&violation_key)
+            .and_then(|v| v.blocked_until)
+        {
+            if until > now {
+                // Retrying inside the advertised penalty is itself a repeated
+                // violation, so abusive tight loops rapidly reach the cap.
+                let violation = store.violations.get_mut(&violation_key).unwrap();
+                violation.count = violation.count.saturating_add(1).min(31);
+                violation.last_seen = Some(now);
+                let multiplier = 1u32 << (violation.count - 1).min(16);
+                let penalty = self
+                    .config
+                    .base_backoff
+                    .saturating_mul(multiplier)
+                    .min(self.config.max_backoff);
+                let retry = until.duration_since(now).max(penalty);
+                violation.blocked_until = Some(now + retry);
+                return Decision {
+                    allowed: false,
+                    limit: violation.limit,
+                    remaining: 0,
+                    reset_after: retry,
+                    retry_after: retry,
+                    scope: violation.scope,
+                    tier,
+                };
+            }
+        }
+
+        store.global.refill(self.config.global, now);
+        let ip_bucket = store
+            .ips
+            .entry(ip_key.clone())
+            .or_insert_with(|| Bucket::full(self.config.per_ip, now));
+        ip_bucket.refill(self.config.per_ip, now);
+        if let Some(ref key) = user_key {
+            store
+                .users
+                .entry(key.clone())
+                .or_insert_with(|| Bucket::full(user_quota, now))
+                .refill(user_quota, now);
+        }
+
+        let mut candidates = vec![("global", self.config.global, store.global.tokens)];
+        candidates.push(("ip", self.config.per_ip, store.ips[&ip_key].tokens));
+        if let Some(ref key) = user_key {
+            candidates.push(("user", user_quota, store.users[key].tokens));
+        }
+        // Report the bucket with the least proportional quota remaining.
+        candidates.sort_by(|a, b| {
+            (a.2 / a.1.burst as f64)
+                .partial_cmp(&(b.2 / b.1.burst as f64))
+                .unwrap()
+                .then_with(|| a.1.burst.cmp(&b.1.burst))
+        });
+        let (scope, quota, tokens) = candidates[0];
+        let exhausted = candidates
+            .iter()
+            .filter(|(_, _, t)| *t < 1.0)
+            .map(|(scope, quota, tokens)| {
+                let wait = Duration::from_secs_f64((1.0 - tokens) / quota.refill_per_second());
+                (*scope, *quota, wait)
+            })
+            .max_by_key(|(_, _, wait)| *wait);
+
+        if let Some((failed_scope, failed_quota, token_wait)) = exhausted {
+            let violation = store.violations.entry(violation_key).or_default();
+            violation.count = violation.count.saturating_add(1).min(31);
+            violation.last_seen = Some(now);
+            violation.scope = failed_scope;
+            violation.limit = failed_quota.burst;
+            let multiplier = 1u32 << (violation.count - 1).min(16);
+            let backoff = self
+                .config
+                .base_backoff
+                .saturating_mul(multiplier)
+                .min(self.config.max_backoff);
+            let retry = token_wait.max(backoff);
+            violation.blocked_until = Some(now + retry);
+            return Decision {
+                allowed: false,
+                limit: failed_quota.burst,
+                remaining: 0,
+                reset_after: token_wait,
+                retry_after: retry,
+                scope: failed_scope,
+                tier,
+            };
+        }
+
+        store.global.tokens -= 1.0;
+        store.ips.get_mut(&ip_key).unwrap().tokens -= 1.0;
+        if let Some(ref key) = user_key {
+            store.users.get_mut(key).unwrap().tokens -= 1.0;
+        }
+        store.violations.remove(&violation_key);
+        let remaining = tokens.floor().max(1.0) as u32 - 1;
+        let reset_after = Duration::from_secs_f64(
+            ((quota.burst as f64 - (tokens - 1.0)) / quota.refill_per_second()).max(0.0),
+        );
+        Decision {
+            allowed: true,
+            limit: quota.burst,
+            remaining,
+            reset_after,
+            retry_after: Duration::ZERO,
+            scope,
+            tier,
+        }
+    }
+}
+
+fn seconds_ceil(duration: Duration) -> u64 {
+    duration
+        .as_secs()
+        .saturating_add(u64::from(duration.subsec_nanos() > 0))
+}
+
+fn add_headers(response: &mut Response, decision: &Decision) {
+    let reset = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .saturating_add(seconds_ceil(decision.reset_after));
+    for (name, value) in [
+        ("x-ratelimit-limit", decision.limit.to_string()),
+        ("x-ratelimit-remaining", decision.remaining.to_string()),
+        ("x-ratelimit-reset", reset.to_string()),
+        ("x-ratelimit-scope", decision.scope.to_string()),
+        ("x-ratelimit-tier", decision.tier.as_str().to_string()),
+    ] {
+        response.headers_mut().insert(
+            HeaderName::from_static(name),
+            HeaderValue::from_str(&value).unwrap(),
+        );
+    }
+    if !decision.allowed {
+        response.headers_mut().insert(
+            "retry-after",
+            HeaderValue::from_str(&seconds_ceil(decision.retry_after).max(1).to_string()).unwrap(),
+        );
+    }
+}
+
+fn parse_forwarded_ip(req: &Request) -> Option<IpAddr> {
+    req.headers()
+        .get("x-forwarded-for")?
+        .to_str()
+        .ok()?
+        .split(',')
+        .next()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Axum middleware entry point for `from_fn_with_state`.
+pub async fn rate_limit_middleware(
+    State(limiter): State<RateLimitMiddleware>,
     req: Request,
     next: Next,
-) -> Result<Response, RateLimitExceeded> {
-    // Prefer API-key based limiting
-    if let Some(api_key) = req.headers().get("x-api-key").and_then(|v| v.to_str().ok()) {
-        let limiter = KEY_LIMITERS
-            .entry(api_key.to_string())
-            .or_insert_with(|| {
-                Arc::new(RateLimiter::direct(Quota::per_minute(
-                    std::num::NonZeroU32::new(1000).unwrap(),
-                )))
-            })
-            .clone();
-
-        if limiter.check().is_err() {
-            return Err(RateLimitExceeded);
-        }
+) -> Response {
+    let peer_ip = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0.ip());
+    let ip = if limiter.config.trust_proxy_headers {
+        parse_forwarded_ip(&req).or(peer_ip)
     } else {
-        // Fall back to IP-based limiting
-        let ip = addr.ip().to_string();
-        let limiter = IP_LIMITERS
-            .entry(ip)
-            .or_insert_with(|| {
-                Arc::new(RateLimiter::direct(Quota::per_minute(
-                    std::num::NonZeroU32::new(100).unwrap(),
-                )))
-            })
-            .clone();
+        peer_ip
+    }
+    .map(|v| v.to_string())
+    .unwrap_or_else(|| "unknown".to_string());
+    let user = req
+        .extensions()
+        .get::<AuthExtension>()
+        .map(|a| a.0.sub.as_str())
+        .or_else(|| {
+            req.headers()
+                .get("x-api-key")
+                .and_then(|v| v.to_str().ok())
+                .filter(|key| key.len() <= 256)
+        });
+    let decision = limiter.check(&ip, user, Instant::now());
+    let mut response = if decision.allowed {
+        next.run(req).await
+    } else {
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": "rate_limit_exceeded",
+                "scope": decision.scope,
+                "retry_after_seconds": seconds_ceil(decision.retry_after).max(1),
+            })),
+        )
+            .into_response()
+    };
+    add_headers(&mut response, &decision);
+    response
+}
 
-        if limiter.check().is_err() {
-            return Err(RateLimitExceeded);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{body::Body, middleware, routing::get, Router};
+    use std::sync::Barrier;
+    use tower::ServiceExt;
+
+    fn config() -> RateLimitConfig {
+        RateLimitConfig {
+            global: BucketQuota::new(600, 100),
+            per_ip: BucketQuota::new(60, 5),
+            free: BucketQuota::new(60, 3),
+            premium: BucketQuota::new(600, 10),
+            enterprise: BucketQuota::new(6_000, 50),
+            base_backoff: Duration::from_secs(1),
+            max_backoff: Duration::from_secs(8),
+            ..RateLimitConfig::default()
         }
     }
 
-    Ok(next.run(req).await)
-}
+    #[test]
+    fn burst_is_limited_and_tokens_recover() {
+        let limiter = RateLimitMiddleware::new(config());
+        let start = Instant::now();
+        for _ in 0..3 {
+            assert!(limiter.check("1.2.3.4", Some("free"), start).allowed);
+        }
+        let denied = limiter.check("1.2.3.4", Some("free"), start);
+        assert!(!denied.allowed);
+        assert_eq!(denied.scope, "user");
+        assert!(
+            limiter
+                .check("1.2.3.4", Some("free"), start + Duration::from_secs(2))
+                .allowed
+        );
+    }
 
+    #[test]
+    fn tiers_and_users_are_isolated() {
+        let limiter = RateLimitMiddleware::new(config());
+        limiter.set_user_tier("paid", RateLimitTier::Premium);
+        let now = Instant::now();
+        for _ in 0..5 {
+            assert!(limiter.check("10.0.0.1", Some("paid"), now).allowed);
+        }
+        assert!(!limiter.check("10.0.0.1", Some("paid"), now).allowed); // IP bucket
+        assert!(limiter.check("10.0.0.2", Some("other"), now).allowed);
+    }
+
+    #[test]
+    fn repeated_violations_back_off_exponentially() {
+        let limiter = RateLimitMiddleware::new(config());
+        let start = Instant::now();
+        for _ in 0..3 {
+            limiter.check("1.1.1.1", Some("u"), start);
+        }
+        let first = limiter.check("1.1.1.1", Some("u"), start);
+        let second = limiter.check("1.1.1.1", Some("u"), start);
+        assert!(second.retry_after > first.retry_after);
+    }
+
+    #[test]
+    fn concurrent_requests_cannot_overspend_bucket() {
+        let limiter = Arc::new(RateLimitMiddleware::new(config()));
+        let barrier = Arc::new(Barrier::new(20));
+        let now = Instant::now();
+        let handles: Vec<_> = (0..20)
+            .map(|_| {
+                let limiter = limiter.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    limiter.check("2.2.2.2", Some("same"), now).allowed
+                })
+            })
+            .collect();
+        let allowed = handles.into_iter().filter(|h| h.join().unwrap()).count();
+        assert_eq!(allowed, 3);
+    }
+
+    #[test]
+    fn zero_tracking_capacity_uses_bounded_overflow_bucket() {
+        let mut cfg = config();
+        cfg.max_tracked_ips = 0;
+        cfg.max_tracked_users = 0;
+        let limiter = RateLimitMiddleware::new(cfg);
+        let now = Instant::now();
+        assert!(limiter.check("a", Some("a"), now).allowed);
+        assert!(limiter.check("b", Some("b"), now).allowed);
+        assert!(limiter.check("c", Some("c"), now).allowed);
+        assert!(!limiter.check("d", Some("d"), now).allowed);
+        let store = limiter.store.lock().unwrap();
+        assert_eq!(store.ips.len(), 1);
+        assert_eq!(store.users.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn middleware_returns_client_headers_and_429_body() {
+        let mut cfg = config();
+        cfg.per_ip = BucketQuota::new(60, 1);
+        let app = Router::new()
+            .route("/", get(|| async { StatusCode::NO_CONTENT }))
+            .layer(middleware::from_fn_with_state(
+                RateLimitMiddleware::new(cfg),
+                rate_limit_middleware,
+            ));
+        let request = || {
+            let mut request = Request::builder().uri("/").body(Body::empty()).unwrap();
+            request
+                .extensions_mut()
+                .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1234))));
+            request
+        };
+
+        let first = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::NO_CONTENT);
+        assert_eq!(first.headers()["x-ratelimit-remaining"], "0");
+        let denied = app.oneshot(request()).await.unwrap();
+        assert_eq!(denied.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(denied.headers().contains_key("retry-after"));
+        assert_eq!(denied.headers()["x-ratelimit-scope"], "ip");
+        let body = axum::body::to_bytes(denied.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"],
+            "rate_limit_exceeded"
+        );
+    }
+}

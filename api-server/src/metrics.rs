@@ -116,4 +116,3 @@ pub async fn metrics_handler() -> Result<String, StatusCode> {
     let handle = PROMETHEUS_HANDLE.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(handle.render())
 }
-
